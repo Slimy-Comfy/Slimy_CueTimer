@@ -1,6 +1,7 @@
 # Slimy_CueTimer
 
 ![Slimy_CueTimer](screenshot.jpg)
+
 ComfyUI用のキュー進捗モニターができるアクセサリです。
 レンダリング中の進行状況、処理速度、履歴、プレビューを1つのノードで確認できます。
 
