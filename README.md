@@ -1,91 +1,77 @@
 # Slimy_CueTimer
 
-<<<<<<< HEAD
-ComfyUI用の進捗モニターノードです。
+[![Slimy_CueTimer](https://github.com/Slimy-Comfy/Slimy_CueTimer/raw/main/screenshot.jpg)](https://github.com/Slimy-Comfy/Slimy_CueTimer/blob/main/screenshot.jpg)
 
-=======
-![Slimy_CueTimer](screenshot.jpg)
+A queue progress monitor accessory for ComfyUI. Track rendering progress, processing speed, history, and live preview — all from a single node.
 
-ComfyUI用のキュー進捗モニターができるアクセサリです。
->>>>>>> 751d6663698e040b8c48796daef9b98bb71618b2
-レンダリング中の進行状況、処理速度、履歴、プレビューを1つのノードで確認できます。
+---
 
-------------------------------------------------------------------------
+## Features
 
-<<<<<<< HEAD
-## 特長
+- Automatically starts a time count when the queue runs, measuring the time to completion
+- Notifies via system notification and sound when the queue finishes
+- Displays the preview image output by KSampler
+- PeepPreview works in real time even when KSampler is inside a subgraph
+- No node connections required — place it anywhere convenient in your workflow
 
--   **PeepPreviewは、KSamplerがサブグラフ内にある場合でもリアルタイム表示できます。**
--   **ノード接続が不要なため、ワークフロー内の見やすい位置へ自由に配置できます。**
-=======
-## 主な機能
--   **キュー実行されると自動的にタイムカウントがスタートし完了までの時間を計測します**
--   **キュー完了時にシステム通知と音でお知らせ**
--   **KSamplerが出力するプレビュー画像を表示します**
--   **PeepPreviewは、KSamplerがサブグラフ内にある場合でもリアルタイム表示できます**
--   **ノード接続が不要なため、ワークフロー内の見やすい位置へ自由に配置できます**
->>>>>>> 751d6663698e040b8c48796daef9b98bb71618b2
+---
 
-------------------------------------------------------------------------
+## Main Features
 
-## 主な機能
+### Progress Display
 
-### プログレス表示
+- Steps progress bar
+- Total progress bar
+- Processing speed (it/s)
+- Completion percentage (%)
+- Elapsed time
+- Remaining time
 
--   Steps進捗バー
--   Total進捗バー
--   処理速度（it/s）
--   完了率（%）
--   経過時間
--   残り時間
+> **Note: Total progress is estimated from recent render history to predict overall progress and remaining time.**
 
-> **※
-> Total進捗は、直近のレンダリング履歴から予測した進捗・残り時間を表示しています。**
+### History
 
-### 履歴
-
--   最新5件を表示
--   ▲▼ボタンで1件ずつスクロール
--   処理終了後も履歴を保持
+- Shows the latest 5 entries
+- Scroll through entries one at a time with the ▲▼ buttons
+- History is retained after processing finishes
 
 ### PeepPreview
 
-Kサンプラーの内部プレビュー画像をリアルタイム表示します。
+Displays KSampler's internal preview image in real time.
+Can be toggled to show or hide.
 
-表示／非表示を切り替え可能です。
+### Notifications
 
-### 通知
+- **SystemNotify**: Shows a system notification when processing finishes
+- **PeepSound**: Plays a notification sound when processing finishes
 
--   SystemNotify：処理終了時にシステム通知を表示
--   PeepSound：処理終了時に通知音を再生
+---
 
-------------------------------------------------------------------------
+## Use Cases
 
-## 用途
+- Monitoring long-running renders
+- Tracking batch processing progress
+- Real-time preview of generated images
+- Estimating render time
 
--   長時間レンダリングの監視
--   バッチ処理の進行確認
--   生成画像のリアルタイム確認
--   レンダリング時間の予測
+---
 
-------------------------------------------------------------------------
+## Requirements
 
-## 動作環境
+- ComfyUI
+- Slimy Custom Nodes
 
--   ComfyUI
--   Slimy Custom Nodes
+---
 
-------------------------------------------------------------------------
-
-## 更新履歴
+## Changelog
 
 ### v1.0
 
--   Steps / Total の2種類の進捗バー
--   履歴5件表示
--   履歴スクロールボタン
--   PeepPreview
--   プレビュー表示／非表示
--   SystemNotify
--   PeepSound
--   経過時間・残り時間・処理速度表示
+- Two progress bars: Steps / Total
+- History display (5 entries)
+- History scroll buttons
+- PeepPreview
+- Toggle preview visibility
+- SystemNotify
+- PeepSound
+- Elapsed time / remaining time / processing speed display
