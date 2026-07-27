@@ -21,7 +21,7 @@ class Slimy_CueTimer:
     RETURN_TYPES = ()
     FUNCTION = "execute"
 
-    OUTPUT_NODE = True
+    OUTPUT_NODE = False
     CATEGORY = "Slimy/Utils"
 
     def execute(self, **kwargs):

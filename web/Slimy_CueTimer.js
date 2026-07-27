@@ -14,6 +14,7 @@ const PeepState = {
     nodesDone: 0,
     nodesTotal: 0,
     predictedTotalMs: 0,
+    frameCount: 1,
 };
 
 function slimyParseHistoryTimeMs(timeStr) {
@@ -218,66 +219,95 @@ const SlimyCueTimerExtension = {
             this._slimyNotifySound = this.properties.peepNotifySound !== false;
             if (this.properties.notifyEnabled === undefined) this.properties.notifyEnabled = true;
             if (this.properties.peepNotifySound === undefined) this.properties.peepNotifySound = true;
-            if (this.properties.peepPreview === undefined) this.properties.peepPreview = true;
+            // 旧バージョン(peepPreview / peepOnly)からのマイグレーション
+            if (this.properties.timerVisible === undefined) {
+                this.properties.timerVisible = this.properties.peepOnly === true ? false : true;
+            }
+            if (this.properties.peepVisible === undefined) {
+                this.properties.peepVisible = this.properties.peepPreview !== false;
+            }
 
             GlobalTimer.registerNode(this);
         };
 
         // --- Canvas drawing ---
         nodeType.prototype.onDrawForeground = function (ctx) {
-            const [w, h] = this.size;
+            const w = this.size[0];
+            let h = this.size[1];
             const PAD       = 8;
             const SB_W      = 9;           // scrollbar width
+            const showTimer = this.properties.timerVisible !== false;
+            const showPeep  = this.properties.peepVisible !== false;
 
-            // ── Main timer ──────────────────────────────────────────────
-            // フォントサイズを横幅いっぱいになるよう決定し、TIMER_Hを逆算する
-            const timerColor = this._running ? "#00ff22" : "#00ff22";
-            const PAD_LR = 10;
-            const maxW   = w - PAD_LR * 2;
+            const CB_SIZE_CONST  = 11;
+            const CB_ROW_RESERVE = CB_SIZE_CONST + 10;  // チェックボックス行の高さ＋上下余白
 
-            const chars  = this._timerStr.split("");
-            const nDigit = chars.filter(c => c !== ":").length;
-            const nSep   = chars.filter(c => c === ":").length;
+            let TIMER_H, HIST_FONT_S, HIST_LINE_H, HIST_ROWS, HIST_H, BAR_AREA_H;
 
-            // 基準フォントサイズで幅を計測してスケールを求める
-            const BASE_FONT = 100;
-            ctx.save();
-            ctx.font = `700 ${BASE_FONT}px "${FONT_FACE}", monospace`;
-            const baseCellW = ctx.measureText("0").width * 1.05;
-            const baseSepW  = ctx.measureText(":").width * 1.1;
-            const baseTotal = nDigit * baseCellW + nSep * baseSepW;
-            let fontSize = Math.max(12, BASE_FONT * (maxW / baseTotal));
-            ctx.font = `700 ${fontSize}px "${FONT_FACE}", monospace`;
+            if (showTimer) {
+                // ── Main timer ──────────────────────────────────────────────
+                // フォントサイズを横幅いっぱいになるよう決定し、TIMER_Hを逆算する
+                const timerColor = this._running ? "#00ff22" : "#00ff22";
+                const PAD_LR = 10;
+                const maxW   = w - PAD_LR * 2;
 
-            const cellW = ctx.measureText("0").width * 1.05;
-            const sepW  = ctx.measureText(":").width * 1.1;
-            const totalW = nDigit * cellW + nSep * sepW;
+                const chars  = this._timerStr.split("");
+                const nDigit = chars.filter(c => c !== ":").length;
+                const nSep   = chars.filter(c => c === ":").length;
 
-            // フォント高さからTIMER_Hを決定（上下パディング込み）
-            const TIMER_PAD_V   = fontSize * 0.18;
-            const CB_SIZE_CONST = 11;
-            const TIMER_BOT_PAD = CB_SIZE_CONST + 10;  // チェックボックス高さ＋上下余白
-            const TIMER_H   = Math.round(fontSize + TIMER_PAD_V * 2) + TIMER_BOT_PAD;
-            const HIST_FONT_S = 10;
-            const HIST_LINE_H = HIST_FONT_S * 1.3;
-            const HIST_ROWS   = 5;
-            const HIST_H      = Math.ceil(HIST_LINE_H * HIST_ROWS + PAD * 2);
-            const BAR_AREA_H  = 42;
-            const DIVIDER_Y   = TIMER_H;
-            const BAR_Y       = DIVIDER_Y + HIST_H;
-            const CONTENT_H   = TIMER_H + HIST_H + BAR_AREA_H;
+                // 基準フォントサイズで幅を計測してスケールを求める
+                const BASE_FONT = 100;
+                ctx.save();
+                ctx.font = `700 ${BASE_FONT}px "${FONT_FACE}", monospace`;
+                const baseCellW = ctx.measureText("0").width * 1.05;
+                const baseSepW  = ctx.measureText(":").width * 1.1;
+                const baseTotal = nDigit * baseCellW + nSep * baseSepW;
+                let fontSize = Math.max(12, BASE_FONT * (maxW / baseTotal));
+                ctx.font = `700 ${fontSize}px "${FONT_FACE}", monospace`;
 
-            let cx = w / 2 - totalW / 2;
-            ctx.fillStyle    = timerColor;
-            ctx.textAlign    = "left";
-            ctx.textBaseline = "middle";
-            const cy = (TIMER_H - TIMER_BOT_PAD) / 2;  // 下マージンを除いた領域の中央
-            chars.forEach(c => {
-                const cw = c === ":" ? sepW : cellW;
-                ctx.fillText(c, cx + (cw - ctx.measureText(c).width) / 2, cy);
-                cx += cw;
-            });
-            ctx.restore();
+                const cellW = ctx.measureText("0").width * 1.05;
+                const sepW  = ctx.measureText(":").width * 1.1;
+                const totalW = nDigit * cellW + nSep * sepW;
+
+                // フォント高さからTIMER_Hを決定（上下パディング込み）
+                const TIMER_PAD_V = fontSize * 0.18;
+                TIMER_H = Math.round(fontSize + TIMER_PAD_V * 2) + CB_ROW_RESERVE;
+                HIST_FONT_S = 10;
+                HIST_LINE_H = HIST_FONT_S * 1.3;
+                HIST_ROWS   = 5;
+                HIST_H      = Math.ceil(HIST_LINE_H * HIST_ROWS + PAD * 2);
+                BAR_AREA_H  = 42;
+
+                let cx = w / 2 - totalW / 2;
+                ctx.fillStyle    = timerColor;
+                ctx.textAlign    = "left";
+                ctx.textBaseline = "middle";
+                const cy = (TIMER_H - CB_ROW_RESERVE) / 2;  // 下マージンを除いた領域の中央
+                chars.forEach(c => {
+                    const cw = c === ":" ? sepW : cellW;
+                    ctx.fillText(c, cx + (cw - ctx.measureText(c).width) / 2, cy);
+                    cx += cw;
+                });
+                ctx.restore();
+            } else {
+                // Timer OFF: タイマー数字・履歴・進捗バーは非表示。チェックボックス行のみ確保
+                TIMER_H    = CB_ROW_RESERVE;
+                HIST_H     = 0;
+                BAR_AREA_H = 0;
+            }
+
+            const DIVIDER_Y = TIMER_H;
+            const BAR_Y     = DIVIDER_Y + HIST_H;
+            const CONTENT_H = TIMER_H + HIST_H + BAR_AREA_H;
+
+            // Timer ON/OFF切替時：増減した分だけノード高さを追従させ、Previewの高さは維持する
+            if (this._prevShowTimer !== undefined && this._prevShowTimer !== showTimer && typeof this._prevContentH === "number") {
+                const contentDelta = CONTENT_H - this._prevContentH;
+                this.size[1] = Math.max(60, this.size[1] + contentDelta);
+                h = this.size[1];
+            }
+            this._prevShowTimer = showTimer;
+            this._prevContentH  = CONTENT_H;
 
             // ── Divider ─────────────────────────────────────────────────
             ctx.save();
@@ -289,26 +319,51 @@ const SlimyCueTimerExtension = {
             ctx.stroke();
             ctx.restore();
 
-            // ── Notify checkboxes (3つ・左寄せ等間隔) ──────────────────
-            const CB_SIZE  = CB_SIZE_CONST;
-            const CB_Y     = DIVIDER_Y - TIMER_BOT_PAD / 2 - CB_SIZE / 2;  // 下マージン帯の中央
-            const CB_GAP   = 16;   // チェックボックス間の余白
+            // ── Notify checkboxes (4つ・ノード幅にあわせて縮小してフィット) ──
+            const CB_LABELS   = ["systemNotify", "peepSound", "Timer", "Peep"];
+            const CB_COLORS   = ["#00ff22", "#4a9eff", "#f0a500", "#ff4fc4"];
+            const CB_FILL     = {
+                "#00ff22": "rgba(0,255,34,0.65)",
+                "#4a9eff": "rgba(74,158,255,0.75)",
+                "#f0a500": "rgba(240,165,0,0.8)",
+                "#ff4fc4": "rgba(255,79,196,0.8)",
+            };
+            const CB_STATES   = [
+                this.properties.notifyEnabled !== false,
+                this.properties.peepNotifySound !== false,
+                showTimer,
+                showPeep,
+            ];
+
+            // 基準サイズ（フル幅時）でラベル幅を計測し、必要な総幅を求める
+            const CB_SIZE_BASE = CB_SIZE_CONST;
+            const CB_FONT_BASE = 10;
+            const CB_GAP_BASE  = 16;   // チェックボックス間の余白
 
             ctx.save();
-            ctx.font         = `500 10px sans-serif`;
+            ctx.font = `500 ${CB_FONT_BASE}px sans-serif`;
+            const labelWidthsBase = CB_LABELS.map(l => ctx.measureText(l).width);
+            const stepsBase = labelWidthsBase.map(lw => CB_SIZE_BASE + 4 + lw);
+            const naturalTotalW = stepsBase.reduce((a, b) => a + b, 0) + CB_GAP_BASE * (CB_LABELS.length - 1);
+
+            // ノード幅に収まるよう縮小率を決定（最小0.5倍まで）
+            const availableW = w - PAD * 2;
+            const cbScale = Math.max(0.5, Math.min(1, availableW / naturalTotalW));
+
+            const CB_SIZE = CB_SIZE_BASE * cbScale;
+            const CB_GAP  = CB_GAP_BASE * cbScale;
+            const CB_Y    = DIVIDER_Y - CB_ROW_RESERVE / 2 - CB_SIZE / 2;  // 下マージン帯の中央
+
+            ctx.font = `500 ${CB_FONT_BASE * cbScale}px sans-serif`;
             ctx.textBaseline = "middle";
+            const labelWidths = CB_LABELS.map(l => ctx.measureText(l).width);
 
-            // ラベル幅を事前計測して等間隔のステップ幅を決める
-            const label0 = "systemNotify";
-            const label1 = "peepSound";
-            const label2 = "peepPreview";
-            const labelW0 = ctx.measureText(label0).width;
-            const labelW1 = ctx.measureText(label1).width;
-            const CB_STEP  = Math.max(CB_SIZE + 4 + labelW0, CB_SIZE + 4 + labelW1) + CB_GAP;
-
-            const CB_X0 = PAD;
-            const CB_X1 = CB_X0 + CB_STEP;
-            const CB_X2 = CB_X1 + CB_STEP;
+            let cbX = PAD;
+            const cbXs = [];
+            labelWidths.forEach(lw => {
+                cbXs.push(cbX);
+                cbX += CB_SIZE + 4 * cbScale + lw + CB_GAP;
+            });
 
             const drawCB = (x, checked, color, label) => {
                 ctx.strokeStyle = checked ? color : "rgba(255,255,255,0.3)";
@@ -320,31 +375,17 @@ const SlimyCueTimerExtension = {
                     ctx.strokeStyle = color;
                     ctx.lineWidth   = 2;
                     ctx.beginPath();
-                    ctx.moveTo(x + 2,              CB_Y + CB_SIZE * 0.5);
-                    ctx.lineTo(x + CB_SIZE * 0.4,  CB_Y + CB_SIZE - 2.5);
-                    ctx.lineTo(x + CB_SIZE - 2,    CB_Y + 2.5);
+                    ctx.moveTo(x + 2 * cbScale,             CB_Y + CB_SIZE * 0.5);
+                    ctx.lineTo(x + CB_SIZE * 0.4,            CB_Y + CB_SIZE - 2.5 * cbScale);
+                    ctx.lineTo(x + CB_SIZE - 2 * cbScale,    CB_Y + 2.5 * cbScale);
                     ctx.stroke();
                 }
-                ctx.fillStyle = checked
-                    ? color.replace(")", ", 0.75)").replace("rgb(", "rgba(").replace(/^#/, "")
-                    : "rgba(255,255,255,0.25)";
-                // hex色はそのまま透明度付きで出せないのでfillStyleを直接指定
-                ctx.fillStyle = checked
-                    ? (color === "#00ff22" ? "rgba(0,255,34,0.65)"
-                    :  color === "#4a9eff" ? "rgba(74,158,255,0.75)"
-                    :                        "rgba(240,165,0,0.8)")
-                    : "rgba(255,255,255,0.25)";
+                ctx.fillStyle = checked ? CB_FILL[color] : "rgba(255,255,255,0.25)";
                 ctx.textAlign = "left";
-                ctx.fillText(label, x + CB_SIZE + 4, CB_Y + CB_SIZE / 2);
+                ctx.fillText(label, x + CB_SIZE + 4 * cbScale, CB_Y + CB_SIZE / 2);
             };
 
-            const enabled         = this.properties.notifyEnabled !== false;
-            const peepEnabledTop  = this.properties.peepNotifySound !== false;
-            const peepPreviewEnabled = this.properties.peepPreview !== false;
-
-            drawCB(CB_X0, enabled,         "#00ff22", label0);
-            drawCB(CB_X1, peepEnabledTop,  "#4a9eff", label1);
-            drawCB(CB_X2, peepPreviewEnabled, "#f0a500", label2);
+            CB_LABELS.forEach((label, i) => drawCB(cbXs[i], CB_STATES[i], CB_COLORS[i], label));
 
             ctx.restore();
 
@@ -354,14 +395,16 @@ const SlimyCueTimerExtension = {
             const cbHit = (x, labelW) => ({
                 x: x - CB_HIT_PAD_X,
                 y: CB_Y - CB_HIT_PAD_Y,
-                w: CB_SIZE + 4 + labelW + CB_HIT_PAD_X * 2,
+                w: CB_SIZE + 4 * cbScale + labelW + CB_HIT_PAD_X * 2,
                 h: CB_SIZE + CB_HIT_PAD_Y * 2
             });
-            this._cbRect        = cbHit(CB_X0, labelW0);
-            this._peepCbRect    = cbHit(CB_X1, labelW1);
-            this._previewCbRect = cbHit(CB_X2, ctx.measureText(label2).width);
+            this._cbRect        = cbHit(cbXs[0], labelWidths[0]);
+            this._peepCbRect    = cbHit(cbXs[1], labelWidths[1]);
+            this._timerVisCbRect = cbHit(cbXs[2], labelWidths[2]);
+            this._peepVisCbRect  = cbHit(cbXs[3], labelWidths[3]);
 
             // ── History area ─────────────────────────────────────────────
+            if (showTimer) {
             const hist      = this.properties.history || [];
             const histFontS = HIST_FONT_S;
             const lineH     = HIST_LINE_H;
@@ -468,8 +511,15 @@ const SlimyCueTimerExtension = {
             }
 
             ctx.restore();
+            } else {
+                this._sbTrack = null;
+                this._histUpRect = null;
+                this._histDownRect = null;
+                this._histLineH = 0;
+            }
 
             // ── Progress bars area (always visible under history) ───────
+            if (showTimer) {
             const BAR_X = PAD;
             const BAR_W = w - PAD * 2;
             const barX = BAR_X + 8;
@@ -513,6 +563,7 @@ const SlimyCueTimerExtension = {
             drawBar("Steps", BAR_Y + 10, stepPct, PeepState.samplerTotal > 0 ? `${PeepState.samplerStep}/${PeepState.samplerTotal}` : "—");
             drawBar("Total", BAR_Y + 26, nodePct, `${Math.round(nodePct * 100)}%`);
             ctx.restore();
+            }
 
             // ── PeepPreview area ───────────────────────────────────────
             const PREVIEW_Y = CONTENT_H + 6;
@@ -520,17 +571,32 @@ const SlimyCueTimerExtension = {
             const PREVIEW_X = PAD;
             const PREVIEW_W = w - PAD * 2;
 
-            if (this.properties.peepPreview !== false) {
+            const showPreview = showPeep;
+
+            if (showPreview) {
                 this._slimyPreviewRect = { x: PREVIEW_X, y: PREVIEW_Y, w: PREVIEW_W, h: PREVIEW_H };
+
+                // Timerが非表示の間は数字が無いため、動作中は枠線を発光させて稼働状況を示す
+                const glowActive = !showTimer && showPeep && this._running;
 
                 ctx.save();
                 ctx.fillStyle = "#111";
-                ctx.strokeStyle = "rgba(0,255,34,0.22)";
-                ctx.lineWidth = 1;
+                if (glowActive) {
+                    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 350);
+                    ctx.shadowColor = `rgba(0,255,90,${0.55 + pulse * 0.35})`;
+                    ctx.shadowBlur  = 10 + pulse * 16;
+                    ctx.strokeStyle = `rgba(60,255,120,${0.7 + pulse * 0.3})`;
+                    ctx.lineWidth = 2;
+                } else {
+                    ctx.strokeStyle = "rgba(0,255,34,0.22)";
+                    ctx.lineWidth = 1;
+                }
                 ctx.beginPath();
                 ctx.roundRect(PREVIEW_X, PREVIEW_Y, PREVIEW_W, PREVIEW_H, 6);
                 ctx.fill();
                 ctx.stroke();
+                ctx.shadowBlur = 0;
+                ctx.shadowColor = "transparent";
 
                 const imgY = PREVIEW_Y + 8;
                 const imgH = Math.max(24, PREVIEW_H - 16);
@@ -544,13 +610,20 @@ const SlimyCueTimerExtension = {
 
                 const img = this._slimyPreviewImage;
                 if (img && img.complete && img.naturalWidth > 0) {
-                    const scale = Math.min(imgW / img.naturalWidth, imgH / img.naturalHeight);
-                    const dw = img.naturalWidth * scale;
-                    const dh = img.naturalHeight * scale;
+                    // 複数フレームのストリップ画像から現在のコマだけを切り出して表示
+                    const frameCount = this._slimyFrameCount || 1;
+                    const frameIndex = frameCount > 1 ? (this._slimyFrameIndex || 0) % frameCount : 0;
+                    const srcFrameW  = img.naturalWidth / frameCount;
+                    const srcFrameH  = img.naturalHeight;
+                    const srcX       = frameIndex * srcFrameW;
+
+                    const scale = Math.min(imgW / srcFrameW, imgH / srcFrameH);
+                    const dw = srcFrameW * scale;
+                    const dh = srcFrameH * scale;
                     const dx = imgX + (imgW - dw) / 2;
                     const dy = imgY + (imgH - dh) / 2;
                     ctx.imageSmoothingEnabled = false;
-                    ctx.drawImage(img, dx, dy, dw, dh);
+                    ctx.drawImage(img, srcX, 0, srcFrameW, srcFrameH, dx, dy, dw, dh);
                 } else {
                     ctx.font = "12px monospace";
                     ctx.fillStyle = "rgba(0,255,34,0.35)";
@@ -604,10 +677,19 @@ const SlimyCueTimerExtension = {
                 }
             }
 
-            if (this._previewCbRect) {
-                const { x, y, w, h } = this._previewCbRect;
+            if (this._timerVisCbRect) {
+                const { x, y, w, h } = this._timerVisCbRect;
                 if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
-                    this.properties.peepPreview = this.properties.peepPreview === false ? true : false;
+                    this.properties.timerVisible = this.properties.timerVisible === false;
+                    this.setDirtyCanvas(true, false);
+                    return true;
+                }
+            }
+
+            if (this._peepVisCbRect) {
+                const { x, y, w, h } = this._peepVisCbRect;
+                if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
+                    this.properties.peepVisible = this.properties.peepVisible === false;
                     this.setDirtyCanvas(true, false);
                     return true;
                 }
@@ -693,7 +775,12 @@ const SlimyCueTimerExtension = {
             this._scrollOffset = 0;
             if (this.properties.notifyEnabled === undefined) this.properties.notifyEnabled = true;
             if (this.properties.peepNotifySound === undefined) this.properties.peepNotifySound = true;
-            if (this.properties.peepPreview === undefined) this.properties.peepPreview = true;
+            if (this.properties.timerVisible === undefined) {
+                this.properties.timerVisible = this.properties.peepOnly === true ? false : true;
+            }
+            if (this.properties.peepVisible === undefined) {
+                this.properties.peepVisible = this.properties.peepPreview !== false;
+            }
             this._slimyNotifySound = this.properties.peepNotifySound !== false;
         };
     },
@@ -719,6 +806,12 @@ const SlimyCueTimerExtension = {
                 PeepState.samplerTotal = 0;
                 const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
                 PeepState.predictedTotalMs = slimyEstimateTotalMsFromHistory(nodes);
+                for (const node of nodes) {
+                    node._slimyPreviewImage = null;
+                    node._slimyFrameCount = 1;
+                    node._slimyFrameIndex = 0;
+                    node.setDirtyCanvas(true, true);
+                }
                 GlobalTimer.start();
             });
             api.addEventListener("executing",             ({ detail }) => {
@@ -740,14 +833,21 @@ const SlimyCueTimerExtension = {
             api.addEventListener("execution_error",       ()           => { PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); });
             api.addEventListener("execution_interrupted", ()           => { PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); });
 
+            api.addEventListener("slimy_peep_frame_count", ({ detail }) => {
+                PeepState.frameCount = detail?.frames || 1;
+            });
+
             api.addEventListener("b_preview", ({ detail }) => {
                 if (!(detail instanceof Blob)) return;
                 const url = URL.createObjectURL(detail);
+                const frameCountForThisImage = PeepState.frameCount;
                 const img = new Image();
                 img.onload = () => {
                     const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
                     for (const node of nodes) {
                         node._slimyPreviewImage = img;
+                        node._slimyFrameCount = frameCountForThisImage;
+                        node._slimyFrameIndex = 0;
                         if (node.properties.peepNotifySound !== false) playPeepPreviewBeep();
                         node.setDirtyCanvas(true, true);
                     }
@@ -755,6 +855,18 @@ const SlimyCueTimerExtension = {
                 };
                 img.src = url;
             });
+
+            // パラパラ漫画アニメーション: 複数フレームのプレビューがある間、コマを一定間隔で送る
+            setInterval(() => {
+                const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
+                for (const node of nodes) {
+                    const frameCount = node._slimyFrameCount || 1;
+                    if (frameCount > 1) {
+                        node._slimyFrameIndex = ((node._slimyFrameIndex || 0) + 1) % frameCount;
+                        node.setDirtyCanvas(true, false);
+                    }
+                }
+            }, 240); // 約4fps(以前の半分)
 
             api.addEventListener("progress", ({ detail }) => {
                 PeepState.samplerStep  = detail.value ?? 0;
