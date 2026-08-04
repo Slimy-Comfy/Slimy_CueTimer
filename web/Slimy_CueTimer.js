@@ -216,6 +216,9 @@ const SlimyCueTimerExtension = {
             this._scrollOffset = 0;
             this._isDraggingScrollbar = false;
             this._slimyPreviewImage = null;
+            this._slimyFrameCount = 1;
+            this._slimyFrameIndex = 0;
+            this._slimyFrameTimer = null;
             this._slimyNotifySound = this.properties.peepNotifySound !== false;
             if (this.properties.notifyEnabled === undefined) this.properties.notifyEnabled = true;
             if (this.properties.peepNotifySound === undefined) this.properties.peepNotifySound = true;
@@ -622,7 +625,8 @@ const SlimyCueTimerExtension = {
                     const dh = srcFrameH * scale;
                     const dx = imgX + (imgW - dw) / 2;
                     const dy = imgY + (imgH - dh) / 2;
-                    ctx.imageSmoothingEnabled = false;
+                    ctx.imageSmoothingEnabled = true;
+                    ctx.imageSmoothingQuality = "high";
                     ctx.drawImage(img, srcX, 0, srcFrameW, srcFrameH, dx, dy, dw, dh);
                 } else {
                     ctx.font = "12px monospace";
@@ -804,9 +808,15 @@ const SlimyCueTimerExtension = {
                 PeepState.nodesTotal = 0;
                 PeepState.samplerStep = 0;
                 PeepState.samplerTotal = 0;
+                PeepState.customPreviewActive = false;
+                PeepState.frameCount = 1;
                 const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
                 PeepState.predictedTotalMs = slimyEstimateTotalMsFromHistory(nodes);
                 for (const node of nodes) {
+                    if (node._slimyFrameTimer) {
+                        clearInterval(node._slimyFrameTimer);
+                        node._slimyFrameTimer = null;
+                    }
                     node._slimyPreviewImage = null;
                     node._slimyFrameCount = 1;
                     node._slimyFrameIndex = 0;
@@ -816,6 +826,13 @@ const SlimyCueTimerExtension = {
             });
             api.addEventListener("executing",             ({ detail }) => {
                 if (detail === null) {
+                    const previewNodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
+                    for (const node of previewNodes) {
+                        if (node._slimyFrameTimer) {
+                            clearInterval(node._slimyFrameTimer);
+                            node._slimyFrameTimer = null;
+                        }
+                    }
                     PeepState.nodesDone = 0;
                     PeepState.nodesTotal = 0;
                     PeepState.samplerStep = 0;
@@ -833,40 +850,44 @@ const SlimyCueTimerExtension = {
             api.addEventListener("execution_error",       ()           => { PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); });
             api.addEventListener("execution_interrupted", ()           => { PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); });
 
-            api.addEventListener("slimy_peep_frame_count", ({ detail }) => {
-                PeepState.frameCount = detail?.frames || 1;
-            });
+            // CueTimer専用の8コマストリップを受信してループ再生する。
+            // KSampler標準b_previewはCueTimerへ表示せず、KSampler本体だけに任せる。
+            api.addEventListener("slimy_peep_preview", ({ detail }) => {
+                const src = detail?.image;
+                if (typeof src !== "string" || !src) return;
 
-            api.addEventListener("b_preview", ({ detail }) => {
-                if (!(detail instanceof Blob)) return;
-                const url = URL.createObjectURL(detail);
-                const frameCountForThisImage = PeepState.frameCount;
+                const frameCount = Math.max(1, Number(detail?.frames) || 1);
                 const img = new Image();
                 img.onload = () => {
                     const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
                     for (const node of nodes) {
                         node._slimyPreviewImage = img;
-                        node._slimyFrameCount = frameCountForThisImage;
+                        node._slimyFrameCount = frameCount;
                         node._slimyFrameIndex = 0;
+
+                        if (node._slimyFrameTimer) clearInterval(node._slimyFrameTimer);
+                        node._slimyFrameTimer = null;
+
+                        if (frameCount > 1 && GlobalTimer.isRunning) {
+                            node._slimyFrameTimer = setInterval(() => {
+                                if (!GlobalTimer.isRunning) {
+                                    clearInterval(node._slimyFrameTimer);
+                                    node._slimyFrameTimer = null;
+                                    return;
+                                }
+                                node._slimyFrameIndex = (node._slimyFrameIndex + 1) % frameCount;
+                                node.setDirtyCanvas(true, false);
+                            }, 240);
+                        }
+
                         if (node.properties.peepNotifySound !== false) playPeepPreviewBeep();
                         node.setDirtyCanvas(true, true);
                     }
-                    URL.revokeObjectURL(url);
                 };
-                img.src = url;
+                img.src = src;
             });
 
-            // パラパラ漫画アニメーション: 複数フレームのプレビューがある間、コマを一定間隔で送る
-            setInterval(() => {
-                const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
-                for (const node of nodes) {
-                    const frameCount = node._slimyFrameCount || 1;
-                    if (frameCount > 1) {
-                        node._slimyFrameIndex = ((node._slimyFrameIndex || 0) + 1) % frameCount;
-                        node.setDirtyCanvas(true, false);
-                    }
-                }
-            }, 240); // 約4fps(以前の半分)
+            // b_previewはKSampler標準の1コマ表示用。CueTimerでは受信しない。
 
             api.addEventListener("progress", ({ detail }) => {
                 PeepState.samplerStep  = detail.value ?? 0;

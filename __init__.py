@@ -1,7 +1,7 @@
 from .Slimy_CueTimer import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from .video_preview_patch import install as install_video_preview_patch
 
-from . import video_preview_patch
-video_preview_patch.install()
+install_video_preview_patch()
 
 WEB_DIRECTORY = "web"
 
