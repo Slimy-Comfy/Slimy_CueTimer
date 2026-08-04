@@ -1,4 +1,5 @@
 # Slimy_CueTimer
+![Slimy_CueTimer](screenshot.jpg)
 
 A progress monitor node for ComfyUI.
 
