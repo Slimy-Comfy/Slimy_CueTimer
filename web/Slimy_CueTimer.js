@@ -8,6 +8,10 @@ const PREDICT_HISTORY_COUNT = 5;
 const PREDICT_MIN_VALID_MS = 15000;
 const PREDICT_MAX_PCT = 0.98;
 
+// PeepPreviewループ設定。末尾フレームを指定回数ぶん保持してから先頭へ戻す。
+const PEEP_PREVIEW_FRAME_MS = 240;
+const PEEP_PREVIEW_END_HOLD_FRAMES = 5;
+
 const PeepState = {
     samplerStep: 0,
     samplerTotal: 0,
@@ -15,7 +19,187 @@ const PeepState = {
     nodesTotal: 0,
     predictedTotalMs: 0,
     frameCount: 1,
+    currentPromptId: null,
+    finalVideo: null, // 完了後に表示する最終動画アセット
+    pendingFinalVideo: null, // 実行中に検出した候補。完了までは表示しない
 };
+
+// --- Final video detection (executed イベントの output から動画/GIFらしきファイルを拾う) ---
+const SLIMY_VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|gif|webp)$/i;
+
+function slimyExtractVideoAssets(output) {
+    const found = [];
+    if (!output) return found;
+    for (const key of Object.keys(output)) {
+        const val = output[key];
+        if (!Array.isArray(val)) continue;
+        for (let item of val) {
+            if (typeof item === "string") {
+                try { item = JSON.parse(item); } catch (e) { continue; }
+            }
+            if (item && typeof item.filename === "string" && SLIMY_VIDEO_EXT_RE.test(item.filename)) {
+                found.push({
+                    filename: item.filename,
+                    subfolder: item.subfolder || "",
+                    type: item.type || "output",
+                });
+            }
+        }
+    }
+    return found;
+}
+
+function slimyBuildViewUrl(asset) {
+    const params = new URLSearchParams({
+        filename: asset.filename,
+        subfolder: asset.subfolder || "",
+        type: asset.type || "output",
+    });
+    return api.apiURL(`/view?${params.toString()}`);
+}
+
+// DOMウィジェット(video等)の上ではホイール/中クリックドラッグがcanvasまで
+// 届かないため、明示的にcanvas要素へ転送してパン・ズームを維持する。
+// (Slimy_VideoSpoolerで同じ問題への対処として実装済みのものを移植)
+function _slimyGetCanvasEl() {
+    return app?.canvasEl || app?.canvas?.canvas || document.querySelector("canvas");
+}
+
+// Synthetic pointer events dispatched to the LiteGraph canvas bubble back to
+// window. Without this guard, the forwarding listeners catch their own events
+// and recursively dispatch forever.
+const _slimyForwardedPointerEvents = new WeakSet();
+
+function _slimyDispatchPointerToCanvas(type, e) {
+    const canvasEl = _slimyGetCanvasEl();
+    if (!canvasEl) return;
+    const forwarded = new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId: e.pointerId,
+        pointerType: e.pointerType || "mouse",
+        isPrimary: e.isPrimary,
+        button: e.button,
+        buttons: e.buttons,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        screenX: e.screenX,
+        screenY: e.screenY,
+        ctrlKey: e.ctrlKey,
+        shiftKey: e.shiftKey,
+        altKey: e.altKey,
+        metaKey: e.metaKey,
+    });
+    _slimyForwardedPointerEvents.add(forwarded);
+    canvasEl.dispatchEvent(forwarded);
+}
+
+function _slimyForwardWheelToCanvas(el) {
+    el.addEventListener("wheel", (e) => {
+        const canvasEl = _slimyGetCanvasEl();
+        if (!canvasEl) return;
+        canvasEl.dispatchEvent(new WheelEvent("wheel", e));
+    }, { passive: true });
+}
+
+function _slimyForwardMiddleDragToCanvas(el) {
+    let dragging = false;
+    const dispatch = (type, e) => _slimyDispatchPointerToCanvas(type, e);
+    const onDown = (e) => {
+        if (e.button !== 1) return;
+        dragging = true;
+        dispatch("pointerdown", e);
+    };
+    const onMove = (e) => {
+        if (_slimyForwardedPointerEvents.has(e)) return;
+        if (dragging) dispatch("pointermove", e);
+    };
+    const onUp = (e) => {
+        if (_slimyForwardedPointerEvents.has(e)) return;
+        if (dragging) { dragging = false; dispatch("pointerup", e); }
+    };
+    el.addEventListener("pointerdown", onDown);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+        dragging = false;
+        el.removeEventListener("pointerdown", onDown);
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+    };
+}
+
+// Native <video> covers the LiteGraph canvas. Forward left-button actions from the
+// picture area back to the canvas so canvas widgets remain clickable and the node
+// can still be dragged. Keep the native control strip and real buttons interactive.
+function _slimyForwardLeftFromVideoToCanvas(container, video) {
+    let forwarding = false;
+    let downX = 0;
+    let downY = 0;
+    let moved = false;
+    const CLICK_DRAG_THRESHOLD_PX = 5;
+
+    const dispatch = (type, e) => _slimyDispatchPointerToCanvas(type, e);
+    const togglePlayback = () => {
+        if (video.paused || video.ended) {
+            video.play().catch(() => { /* browser may block playback */ });
+        } else {
+            video.pause();
+        }
+    };
+
+    const isNativeInteractiveArea = (e) => {
+        if (e.target instanceof HTMLButtonElement || e.target instanceof HTMLInputElement) return true;
+        if (e.target !== video) return false;
+        const r = video.getBoundingClientRect();
+        // Preserve the browser's native video controls at the bottom.
+        return e.clientY >= r.bottom - 48;
+    };
+
+    const onDown = (e) => {
+        if (e.button !== 0 || isNativeInteractiveArea(e)) return;
+        forwarding = true;
+        downX = e.clientX;
+        downY = e.clientY;
+        moved = false;
+        e.preventDefault();
+        e.stopPropagation();
+        dispatch("pointerdown", e);
+    };
+    const onMove = (e) => {
+        if (_slimyForwardedPointerEvents.has(e) || !forwarding) return;
+        if (!moved && Math.hypot(e.clientX - downX, e.clientY - downY) > CLICK_DRAG_THRESHOLD_PX) {
+            moved = true;
+        }
+        e.preventDefault();
+        dispatch("pointermove", e);
+    };
+    const onUp = (e) => {
+        if (_slimyForwardedPointerEvents.has(e) || !forwarding) return;
+        forwarding = false;
+        e.preventDefault();
+        dispatch("pointerup", e);
+        if (!moved) togglePlayback();
+    };
+    const onCancel = (e) => {
+        if (_slimyForwardedPointerEvents.has(e) || !forwarding) return;
+        forwarding = false;
+        dispatch("pointercancel", e);
+    };
+
+    container.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onCancel, true);
+
+    return () => {
+        forwarding = false;
+        container.removeEventListener("pointerdown", onDown, true);
+        window.removeEventListener("pointermove", onMove, true);
+        window.removeEventListener("pointerup", onUp, true);
+        window.removeEventListener("pointercancel", onCancel, true);
+    };
+}
 
 function slimyParseHistoryTimeMs(timeStr) {
     if (typeof timeStr !== "string") return 0;
@@ -134,6 +318,37 @@ function playPeepPreviewBeep() {
     }
 }
 
+// --- VRAM Clear ---
+// キュー完了直後にComfyUIコア標準の /free エンドポイントを叩き、
+// モデルのアンロード + 実行キャッシュのクリアをまとめて行う。
+// (ComfyUI-Manager の "Free model and node cache" ボタンと同じ仕組み)
+let _slimyVramClearInFlight = false;
+async function slimyClearVRAM() {
+    if (_slimyVramClearInFlight) return;
+    _slimyVramClearInFlight = true;
+    try {
+        const res = await api.fetchApi("/free", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ unload_models: true, free_memory: true }),
+        });
+        if (!res.ok) {
+            console.warn("[Slimy_CueTimer] VRAM clear failed:", await res.text());
+        }
+    } catch (err) {
+        console.warn("[Slimy_CueTimer] VRAM clear failed:", err);
+    } finally {
+        _slimyVramClearInFlight = false;
+    }
+}
+
+// いずれかのSlimy_CueTimerノードでVRAM Clearが有効なら実行する。
+// 正常終了(done) / エラー(error) / 中断(interrupted) いずれの停止理由でも共通で使う。
+function slimyMaybeClearVRAM() {
+    const vramEnabled = [...GlobalTimer.activeNodes].some(n => n.properties.vramCleanupEnabled !== false);
+    if (vramEnabled) slimyClearVRAM();
+}
+
 // --- Global Timer Manager ---
 const GlobalTimer = {
     startTime: 0,
@@ -219,9 +434,12 @@ const SlimyCueTimerExtension = {
             this._slimyFrameCount = 1;
             this._slimyFrameIndex = 0;
             this._slimyFrameTimer = null;
+            this._slimyFinalVideoAsset = null;
             this._slimyNotifySound = this.properties.peepNotifySound !== false;
             if (this.properties.notifyEnabled === undefined) this.properties.notifyEnabled = true;
             if (this.properties.peepNotifySound === undefined) this.properties.peepNotifySound = true;
+            if (this.properties.vramCleanupEnabled === undefined) this.properties.vramCleanupEnabled = true;
+            if (this.properties.autoPlayEnabled === undefined) this.properties.autoPlayEnabled = true;
             // 旧バージョン(peepPreview / peepOnly)からのマイグレーション
             if (this.properties.timerVisible === undefined) {
                 this.properties.timerVisible = this.properties.peepOnly === true ? false : true;
@@ -231,6 +449,155 @@ const SlimyCueTimerExtension = {
             }
 
             GlobalTimer.registerNode(this);
+        };
+
+        // --- Final video playback (native <video controls> = シークバー・再生時間・
+        //     全画面ボタンが標準で付く。canvasへの手描画はやめてDOM要素をそのまま使う) ---
+        nodeType.prototype._slimyEnsureVideoWidget = function () {
+            if (this._slimyVideoWidget) return this._slimyVideoWidget;
+
+            // outer: addDOMWidgetがノードの残り領域全体に合わせて自動でサイズ管理する
+            // コンテナ。pointer-events:noneにして、下のcanvas(チェックボックスやノードの
+            // ドラッグ等)へのクリック/ドラッグを常に素通りさせる。
+            const outer = document.createElement("div");
+            outer.style.cssText = "position:absolute;left:0;top:0;width:0;height:0;margin:0;padding:0;border:0;pointer-events:none;overflow:visible;";
+
+            // inner: 実際に見える・操作できる部分だけ。onDrawForegroundで毎フレーム
+            // imgX/imgY/imgW/imgHへ位置合わせする。ここだけpointer-events:autoに戻す。
+            const inner = document.createElement("div");
+            inner.style.cssText = "position:absolute;display:none;flex-direction:column;gap:4px;box-sizing:border-box;pointer-events:auto;z-index:5;";
+            _slimyForwardWheelToCanvas(inner);
+            _slimyForwardMiddleDragToCanvas(inner);
+            outer.appendChild(inner);
+
+            const video = document.createElement("video");
+            video.controls = true;
+            video.loop = true;
+            video.muted = true; // 自動再生ブロック回避。音はユーザーがcontrolsからミュート解除できる
+            video.playsInline = true;
+            video.style.cssText = "width:100%;flex:1 1 auto;min-height:0;background:#000;border-radius:4px;object-fit:contain;";
+            inner.appendChild(video);
+            this._slimyVideoPointerCleanup?.();
+            this._slimyVideoPointerCleanup = _slimyForwardLeftFromVideoToCanvas(inner, video);
+
+            const btnRow = document.createElement("div");
+            btnRow.style.cssText = "display:flex;align-items:center;gap:6px;flex:0 0 20px;height:20px;min-height:20px;overflow:hidden;";
+
+            const revealBtn = document.createElement("button");
+            revealBtn.textContent = "📂 Open folder";
+            revealBtn.title = "Reveal this file in the file manager (on the machine running ComfyUI)";
+            revealBtn.style.cssText = "flex:0 0 92px;width:92px;height:20px;min-height:20px;cursor:pointer;padding:0 6px;background:#222;color:#ddd;border:1px solid #444;border-radius:3px;font-size:10px;line-height:18px;white-space:nowrap;";
+            revealBtn.addEventListener("click", async (e) => {
+                e.preventDefault();
+                const asset = this._slimyFinalVideoAsset;
+                if (!asset) return;
+                try {
+                    const res = await api.fetchApi("/slimy/cuetimer/reveal", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ filename: asset.filename, subfolder: asset.subfolder || "", type: asset.type || "output" }),
+                    });
+                    if (!res.ok) console.warn("[Slimy_CueTimer] reveal failed:", await res.text());
+                } catch (err) {
+                    console.warn("[Slimy_CueTimer] reveal failed:", err);
+                }
+            });
+            btnRow.appendChild(revealBtn);
+
+            const fileNameEl = document.createElement("div");
+            fileNameEl.textContent = "";
+            fileNameEl.style.cssText = "flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aaa;font-size:10px;line-height:20px;";
+            btnRow.appendChild(fileNameEl);
+
+            inner.appendChild(btnRow);
+
+            const widget = this.addDOMWidget("slimy_final_video", "div", outer, {
+                serialize: false,
+                hideOnZoom: false,
+                getHeight: () => 0,
+                getMinHeight: () => 0,
+            });
+            widget.computeSize = () => [0, 0]; // LiteGraphの自動配置には任せず、onDrawForegroundで毎フレーム位置を上書きする
+            widget.element = outer;
+
+            // addDOMWidget が生成する外側ラッパーは、ノードの残り領域ぶんの
+            // 透明な当たり判定を持つことがある。動画本体以外を掴めなくなるため、
+            // ラッパー自身をゼロサイズ・クリック透過に固定する。
+            const normalizeDomWidgetWrapper = () => {
+                // outer.parentElement は ComfyUI が挿入する .h-full.w-full。
+                // 実際にノード外まで当たり判定を持つのは、その外側の
+                // .dom-widget.size-full なので、closest() で直接取得する。
+                const wrapper = outer.closest?.(".dom-widget") || outer.parentElement?.parentElement;
+                if (!wrapper) return;
+
+                // ComfyUI が描画更新のたびに inline style を戻すため !important で固定。
+                wrapper.style.setProperty("pointer-events", "none", "important");
+                wrapper.style.setProperty("width", "0px", "important");
+                wrapper.style.setProperty("height", "0px", "important");
+                wrapper.style.setProperty("min-width", "0px", "important");
+                wrapper.style.setProperty("min-height", "0px", "important");
+                wrapper.style.setProperty("margin", "0", "important");
+                wrapper.style.setProperty("padding", "0", "important");
+                wrapper.style.setProperty("overflow", "visible", "important");
+
+                // 中間ラッパーも当たり判定を持たせない。実際の動画領域 inner だけが
+                // pointer-events:auto なので、動画コントロールはそのまま操作できる。
+                const bridge = outer.parentElement;
+                if (bridge && bridge !== wrapper) {
+                    bridge.style.setProperty("pointer-events", "none", "important");
+                    bridge.style.setProperty("width", "0px", "important");
+                    bridge.style.setProperty("height", "0px", "important");
+                    bridge.style.setProperty("overflow", "visible", "important");
+                }
+            };
+            normalizeDomWidgetWrapper();
+            requestAnimationFrame(normalizeDomWidgetWrapper);
+            this._slimyNormalizeVideoWidgetWrapper = normalizeDomWidgetWrapper;
+
+            this._slimyVideoWidget = widget;
+            this._slimyVideoEl = video;
+            this._slimyVideoFilenameEl = fileNameEl;
+            this._slimyVideoWrapEl = inner; // 表示切替・位置合わせはこちら(pointer-events:auto側)に対して行う
+            return widget;
+        };
+
+        nodeType.prototype._slimyClearFinalVideo = function () {
+            this._slimyFinalVideoAsset = null;
+            if (this._slimyVideoFilenameEl) {
+                this._slimyVideoFilenameEl.textContent = "";
+                this._slimyVideoFilenameEl.title = "";
+            }
+            if (this._slimyVideoEl) {
+                try {
+                    this._slimyVideoEl.pause();
+                    this._slimyVideoEl.removeAttribute("src");
+                    this._slimyVideoEl.load();
+                } catch (e) { /* ignore */ }
+            }
+            if (this._slimyVideoWrapEl) this._slimyVideoWrapEl.style.display = "none";
+        };
+
+        nodeType.prototype._slimySetFinalVideo = function (asset) {
+            this._slimyEnsureVideoWidget();
+
+            // 動画が来たらstripアニメーションは止めて主役を譲る
+            if (this._slimyFrameTimer) {
+                clearInterval(this._slimyFrameTimer);
+                this._slimyFrameTimer = null;
+            }
+
+            this._slimyFinalVideoAsset = asset;
+            if (this._slimyVideoFilenameEl) {
+                const fileName = asset?.filename || "";
+                this._slimyVideoFilenameEl.textContent = fileName;
+                this._slimyVideoFilenameEl.title = fileName;
+            }
+            this._slimyVideoEl.src = slimyBuildViewUrl(asset);
+            if (this.properties.autoPlayEnabled !== false) {
+                this._slimyVideoEl.play().catch(() => { /* 自動再生ブロック時はcontrolsから再生させる */ });
+            }
+            this._slimyVideoWrapEl.style.display = "flex";
+            this.setDirtyCanvas(true, false);
         };
 
         // --- Canvas drawing ---
@@ -323,19 +690,23 @@ const SlimyCueTimerExtension = {
             ctx.restore();
 
             // ── Notify checkboxes (4つ・ノード幅にあわせて縮小してフィット) ──
-            const CB_LABELS   = ["systemNotify", "peepSound", "Timer", "Peep"];
-            const CB_COLORS   = ["#00ff22", "#4a9eff", "#f0a500", "#ff4fc4"];
+            const CB_LABELS   = ["systemNotify", "peepSound", "Timer", "Peep", "VRAM Clear", "AutoPlay"];
+            const CB_COLORS   = ["#00ff22", "#4a9eff", "#f0a500", "#ff4fc4", "#ff6b3d", "#c084fc"];
             const CB_FILL     = {
                 "#00ff22": "rgba(0,255,34,0.65)",
                 "#4a9eff": "rgba(74,158,255,0.75)",
                 "#f0a500": "rgba(240,165,0,0.8)",
                 "#ff4fc4": "rgba(255,79,196,0.8)",
+                "#ff6b3d": "rgba(255,107,61,0.8)",
+                "#c084fc": "rgba(192,132,252,0.8)",
             };
             const CB_STATES   = [
                 this.properties.notifyEnabled !== false,
                 this.properties.peepNotifySound !== false,
                 showTimer,
                 showPeep,
+                this.properties.vramCleanupEnabled !== false,
+                this.properties.autoPlayEnabled !== false,
             ];
 
             // 基準サイズ（フル幅時）でラベル幅を計測し、必要な総幅を求める
@@ -405,6 +776,8 @@ const SlimyCueTimerExtension = {
             this._peepCbRect    = cbHit(cbXs[1], labelWidths[1]);
             this._timerVisCbRect = cbHit(cbXs[2], labelWidths[2]);
             this._peepVisCbRect  = cbHit(cbXs[3], labelWidths[3]);
+            this._vramCbRect     = cbHit(cbXs[4], labelWidths[4]);
+            this._autoPlayCbRect = cbHit(cbXs[5], labelWidths[5]);
 
             // ── History area ─────────────────────────────────────────────
             if (showTimer) {
@@ -611,8 +984,27 @@ const SlimyCueTimerExtension = {
                 ctx.roundRect(imgX, imgY, imgW, imgH, 5);
                 ctx.fill();
 
+                const hasFinalVideo = !!this._slimyFinalVideoAsset;
                 const img = this._slimyPreviewImage;
-                if (img && img.complete && img.naturalWidth > 0) {
+
+                if (hasFinalVideo && this._slimyVideoWrapEl) {
+                    // 実DOMのvideo要素をこの領域にぴったり重ねる(controls標準搭載＝
+                    // シークバー・再生時間・全画面ボタンが自動で付く)。
+                    const el = this._slimyVideoWrapEl;
+                    // ComfyUI側がリサイズ時にDOMラッパーの寸法を戻す場合があるため、
+                    // 描画ごとにゼロサイズ・クリック透過を再適用する。
+                    this._slimyNormalizeVideoWidgetWrapper?.();
+                    // addDOMWidget の基準点はノード左上ではなく、
+                    // 横10pxの標準マージン + widget.y の位置に置かれる。
+                    // imgX/imgY はノード左上基準なので、その基準差を明示的に差し引く。
+                    const widgetY = Number(this._slimyVideoWidget?.y) || 0;
+                    const widgetMarginX = 10;
+                    el.style.display = "flex";
+                    el.style.left    = `${imgX - widgetMarginX}px`;
+                    el.style.top     = `${imgY - widgetY}px`;
+                    el.style.width   = `${imgW}px`;
+                    el.style.height  = `${imgH}px`;
+                } else if (img && img.complete && img.naturalWidth > 0) {
                     // 複数フレームのストリップ画像から現在のコマだけを切り出して表示
                     const frameCount = this._slimyFrameCount || 1;
                     const frameIndex = frameCount > 1 ? (this._slimyFrameIndex || 0) % frameCount : 0;
@@ -644,6 +1036,7 @@ const SlimyCueTimerExtension = {
                 }
             } else {
                 this._slimyPreviewRect = null;
+                if (this._slimyVideoWrapEl) this._slimyVideoWrapEl.style.display = "none";
                 // プレビューOFF時：現在のサイズを記憶してコンパクトに縮小
                 const compactH = CONTENT_H + PAD * 2;
                 if (this.size[1] > compactH) {
@@ -694,6 +1087,24 @@ const SlimyCueTimerExtension = {
                 const { x, y, w, h } = this._peepVisCbRect;
                 if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
                     this.properties.peepVisible = this.properties.peepVisible === false;
+                    this.setDirtyCanvas(true, false);
+                    return true;
+                }
+            }
+
+            if (this._vramCbRect) {
+                const { x, y, w, h } = this._vramCbRect;
+                if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
+                    this.properties.vramCleanupEnabled = this.properties.vramCleanupEnabled === false;
+                    this.setDirtyCanvas(true, false);
+                    return true;
+                }
+            }
+
+            if (this._autoPlayCbRect) {
+                const { x, y, w, h } = this._autoPlayCbRect;
+                if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
+                    this.properties.autoPlayEnabled = this.properties.autoPlayEnabled === false;
                     this.setDirtyCanvas(true, false);
                     return true;
                 }
@@ -764,6 +1175,14 @@ const SlimyCueTimerExtension = {
         // --- Serialize / Configure ---
         nodeType.prototype.onRemoved = function () {
             GlobalTimer.unregisterNode(this);
+            if (this._slimyFrameTimer) {
+                clearInterval(this._slimyFrameTimer);
+                this._slimyFrameTimer = null;
+            }
+            this._slimyVideoPointerCleanup?.();
+            this._slimyVideoPointerCleanup = null;
+            this._slimyPreviewImage = null;
+            this._slimyClearFinalVideo?.();
             origRemoved?.apply(this, arguments);
         };
 
@@ -779,6 +1198,8 @@ const SlimyCueTimerExtension = {
             this._scrollOffset = 0;
             if (this.properties.notifyEnabled === undefined) this.properties.notifyEnabled = true;
             if (this.properties.peepNotifySound === undefined) this.properties.peepNotifySound = true;
+            if (this.properties.vramCleanupEnabled === undefined) this.properties.vramCleanupEnabled = true;
+            if (this.properties.autoPlayEnabled === undefined) this.properties.autoPlayEnabled = true;
             if (this.properties.timerVisible === undefined) {
                 this.properties.timerVisible = this.properties.peepOnly === true ? false : true;
             }
@@ -802,7 +1223,7 @@ const SlimyCueTimerExtension = {
         let eventsBound = false;
         if (!eventsBound) {
             eventsBound = true;
-            api.addEventListener("execution_start",       ()           => {
+            api.addEventListener("execution_start",       ({ detail }) => {
                 SlimyNotify.requestPermission();
                 PeepState.nodesDone = 0;
                 PeepState.nodesTotal = 0;
@@ -810,6 +1231,9 @@ const SlimyCueTimerExtension = {
                 PeepState.samplerTotal = 0;
                 PeepState.customPreviewActive = false;
                 PeepState.frameCount = 1;
+                PeepState.currentPromptId = detail?.prompt_id ?? null;
+                PeepState.finalVideo = null;
+                PeepState.pendingFinalVideo = null;
                 const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
                 PeepState.predictedTotalMs = slimyEstimateTotalMsFromHistory(nodes);
                 for (const node of nodes) {
@@ -820,6 +1244,7 @@ const SlimyCueTimerExtension = {
                     node._slimyPreviewImage = null;
                     node._slimyFrameCount = 1;
                     node._slimyFrameIndex = 0;
+                    node._slimyClearFinalVideo?.();
                     node.setDirtyCanvas(true, true);
                 }
                 GlobalTimer.start();
@@ -833,12 +1258,22 @@ const SlimyCueTimerExtension = {
                             node._slimyFrameTimer = null;
                         }
                     }
+                    // 実行中に検出した動画は、キュー完了後にだけ表示する。
+                    if (PeepState.pendingFinalVideo) {
+                        PeepState.finalVideo = PeepState.pendingFinalVideo;
+                        for (const node of previewNodes) node._slimySetFinalVideo?.(PeepState.finalVideo);
+                    }
+                    PeepState.pendingFinalVideo = null;
+
                     PeepState.nodesDone = 0;
                     PeepState.nodesTotal = 0;
                     PeepState.samplerStep = 0;
                     PeepState.samplerTotal = 0;
                     PeepState.predictedTotalMs = 0;
                     GlobalTimer.stop("done");
+
+                    // タイマー停止後にVRAMクリアを実行(いずれかのノードで有効な場合のみ)
+                    slimyMaybeClearVRAM();
                 } else {
                     PeepState.nodesDone += 1;
                     if (PeepState.nodesTotal === 0) PeepState.nodesTotal = app.graph?._nodes?.length ?? 1;
@@ -847,14 +1282,15 @@ const SlimyCueTimerExtension = {
                 const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
                 for (const node of nodes) node.setDirtyCanvas(true, false);
             });
-            api.addEventListener("execution_error",       ()           => { PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); });
-            api.addEventListener("execution_interrupted", ()           => { PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); });
+            api.addEventListener("execution_error",       ()           => { PeepState.pendingFinalVideo = null; PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); slimyMaybeClearVRAM(); });
+            api.addEventListener("execution_interrupted", ()           => { PeepState.pendingFinalVideo = null; PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); slimyMaybeClearVRAM(); });
 
-            // CueTimer専用の8コマストリップを受信してループ再生する。
+            // CueTimer専用の近傍フレームアニメーションを受信してループ再生する。
             // KSampler標準b_previewはCueTimerへ表示せず、KSampler本体だけに任せる。
             api.addEventListener("slimy_peep_preview", ({ detail }) => {
                 const src = detail?.image;
                 if (typeof src !== "string" || !src) return;
+                PeepState.customPreviewActive = true;
 
                 const frameCount = Math.max(1, Number(detail?.frames) || 1);
                 const img = new Image();
@@ -864,6 +1300,7 @@ const SlimyCueTimerExtension = {
                         node._slimyPreviewImage = img;
                         node._slimyFrameCount = frameCount;
                         node._slimyFrameIndex = 0;
+                        node._slimyEndHoldTicks = 0;
 
                         if (node._slimyFrameTimer) clearInterval(node._slimyFrameTimer);
                         node._slimyFrameTimer = null;
@@ -875,9 +1312,19 @@ const SlimyCueTimerExtension = {
                                     node._slimyFrameTimer = null;
                                     return;
                                 }
-                                node._slimyFrameIndex = (node._slimyFrameIndex + 1) % frameCount;
+                                const lastFrameIndex = frameCount - 1;
+                                if (node._slimyFrameIndex >= lastFrameIndex) {
+                                    node._slimyEndHoldTicks = (node._slimyEndHoldTicks || 0) + 1;
+                                    if (node._slimyEndHoldTicks >= PEEP_PREVIEW_END_HOLD_FRAMES) {
+                                        node._slimyFrameIndex = 0;
+                                        node._slimyEndHoldTicks = 0;
+                                    }
+                                } else {
+                                    node._slimyFrameIndex += 1;
+                                    node._slimyEndHoldTicks = 0;
+                                }
                                 node.setDirtyCanvas(true, false);
-                            }, 240);
+                            }, PEEP_PREVIEW_FRAME_MS);
                         }
 
                         if (node.properties.peepNotifySound !== false) playPeepPreviewBeep();
@@ -887,13 +1334,52 @@ const SlimyCueTimerExtension = {
                 img.src = src;
             });
 
-            // b_previewはKSampler標準の1コマ表示用。CueTimerでは受信しない。
+            // 静止画ワークフローでは slimy_peep_preview が来ないため、
+            // KSampler標準の1コマ Latent Preview をフォールバックとして受信する。
+            // 動画用の近傍フレームプレビューが一度でも来た実行では、そちらを優先する。
+            api.addEventListener("b_preview", ({ detail }) => {
+                if (PeepState.customPreviewActive) return;
+                const blob = detail instanceof Blob ? detail : null;
+                if (!blob) return;
+
+                const objectUrl = URL.createObjectURL(blob);
+                const img = new Image();
+                img.onload = () => {
+                    URL.revokeObjectURL(objectUrl);
+                    const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
+                    for (const node of nodes) {
+                        if (node._slimyFrameTimer) clearInterval(node._slimyFrameTimer);
+                        node._slimyFrameTimer = null;
+                        node._slimyPreviewImage = img;
+                        node._slimyFrameCount = 1;
+                        node._slimyFrameIndex = 0;
+                        node._slimyEndHoldTicks = 0;
+                        node.setDirtyCanvas(true, true);
+                    }
+                };
+                img.onerror = () => URL.revokeObjectURL(objectUrl);
+                img.src = objectUrl;
+            });
 
             api.addEventListener("progress", ({ detail }) => {
                 PeepState.samplerStep  = detail.value ?? 0;
                 PeepState.samplerTotal = detail.max   ?? 0;
                 const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
                 for (const node of nodes) node.setDirtyCanvas(true, false);
+            });
+
+            // Upscaleサブツリーなどで動画保存ノードが複数あっても、
+            // 実行順(トポロジカル順)で最後に検出された output タイプの動画を「最終成果物」として採用する。
+            api.addEventListener("executed", ({ detail }) => {
+                if (detail?.prompt_id && detail.prompt_id !== PeepState.currentPromptId) return; // 別ランのイベントは無視
+
+                const assets = slimyExtractVideoAssets(detail?.output);
+                if (assets.length === 0) return;
+
+                const chosen = assets.find(a => a.type === "output") || assets[assets.length - 1];
+
+                // 実行途中では表示せず、最後に検出した候補だけ保持する。
+                PeepState.pendingFinalVideo = chosen;
             });
         }
     },

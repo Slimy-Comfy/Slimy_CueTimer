@@ -1,13 +1,13 @@
 """
-KSampler標準プレビューは1枚のまま維持し、CueTimerだけへ8コマストリップを送る。
-8コマ窓はKSamplerのステップ進捗に応じて動画時間軸上を後方へスライドする。
+KSampler標準プレビューは1枚のまま維持し、CueTimerだけへ複数コマのストリップを送る。
+プレビュー窓はKSamplerのステップ進捗に応じて動画時間軸上を後方へスライドする。
 
 例（100フレーム / 20ステップ）:
   step 1  -> 0-7
   step 10 -> 50-57
   step 20 -> 92-99
 
-KSampler側には、その窓の8番目（最後）の1コマだけを返す。
+KSampler側には、その窓の最後の1コマだけを返す。
 """
 
 import base64
@@ -18,7 +18,9 @@ import numpy as np
 import torch
 from PIL import Image
 
-MAX_PREVIEW_FRAMES = 8
+# CueTimerのループアニメーションに含める最大コマ数。
+# 8へ戻す場合は、この値だけを8に変更する。
+MAX_PREVIEW_FRAMES = 16
 _PREVIEW_PROGRESS = ContextVar("slimy_preview_progress", default=None)
 
 
@@ -47,19 +49,10 @@ class _SlidingWindowPreviewer:
         self._taesd = None
 
     def _get_taesd(self):
-        if self._taesd is not None:
-            return self._taesd
-        try:
-            import folder_paths
-            from comfy.taesd.taesd import TAESD
-
-            name = getattr(self.latent_format, "taesd_decoder_name", None)
-            path = folder_paths.get_full_path("vae_approx", name) if name else None
-            if path:
-                self._taesd = TAESD(None, path).to(self.device)
-        except Exception as e:
-            print(f"[Slimy_CueTimer] TAESD読み込み失敗: {e}")
-        return self._taesd
+        # CueTimer専用にTAESDをGPUへ追加常駐させない。
+        # 標準previewerとは別のデコーダを保持すると、実行後も専用GPUメモリが
+        # 解放されにくくなるため、ストリップは軽量latent2rgbで生成する。
+        return None
 
     def _latent2rgb_frame(self, latent_chw):
         factors = getattr(self.latent_format, "latent_rgb_factors", None)
@@ -97,15 +90,12 @@ class _SlidingWindowPreviewer:
         return min(max_start, round(total_frames * ratio))
 
     def _decode_strip(self, x0, start: int, count: int) -> Image.Image:
-        taesd = self._get_taesd()
         frames = []
+        # CueTimer用ストリップは追加モデルを使わずlatent2rgbだけで作る。
+        # これにより独自TAESDのGPU常駐と、各ステップ16回のデコードを避ける。
         with torch.no_grad():
             for t in range(start, start + count):
-                if taesd is not None:
-                    dec = taesd.decode(x0[0:1, :, t])[0]
-                    frames.append(_tensor_to_pil(dec))
-                else:
-                    frames.append(self._latent2rgb_frame(x0[0, :, t]))
+                frames.append(self._latent2rgb_frame(x0[0, :, t]))
 
         width, height = frames[0].size
         strip = Image.new("RGB", (width * len(frames), height))
@@ -138,11 +128,11 @@ class _SlidingWindowPreviewer:
             frame_count = min(MAX_PREVIEW_FRAMES, total_frames)
             start = self._window_start(total_frames, frame_count)
 
-            # CueTimerには8コマ窓を送る。
+            # CueTimerには設定したコマ数のプレビュー窓を送る。
             strip = self._decode_strip(x0, start, frame_count)
             self._send_cuetimer_preview(strip, frame_count, start)
 
-            # KSampler本体には窓の8番目（最後）の1コマだけを返す。
+            # KSampler本体には窓の最後の1コマだけを返す。
             last_index = start + frame_count - 1
             selected = x0[:, :, last_index:last_index + 1]
             return self.base.decode_latent_to_preview_image(preview_format, selected)
@@ -188,4 +178,4 @@ def install():
     latent_preview.get_previewer = patched_get_previewer
     latent_preview.prepare_callback = patched_prepare_callback
     latent_preview._slimy_sliding_window_preview_patched = True
-    print("[Slimy_CueTimer] KSampler 1コマ / CueTimer 8コマ・スライド窓patchを適用しました")
+    print(f"[Slimy_CueTimer] KSampler 1コマ / CueTimer 最大{MAX_PREVIEW_FRAMES}コマ・スライド窓patchを適用しました")
