@@ -1,6 +1,27 @@
 import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
+// Server-side single-source feature flags. Email defaults OFF until the
+// backend explicitly reports it enabled, so public builds fail closed.
+let SLIMY_EMAIL_ENABLED = false;
+let _slimyFeatureFlagsPromise = null;
+async function slimyLoadFeatureFlags() {
+    if (_slimyFeatureFlagsPromise) return _slimyFeatureFlagsPromise;
+    _slimyFeatureFlagsPromise = (async () => {
+        try {
+            const res = await api.fetchApi("/slimy/cuetimer/features", { cache: "no-store" });
+            if (res.ok) {
+                const flags = await res.json();
+                SLIMY_EMAIL_ENABLED = flags?.email === true;
+            }
+        } catch (e) {
+            SLIMY_EMAIL_ENABLED = false;
+        }
+        return SLIMY_EMAIL_ENABLED;
+    })();
+    return _slimyFeatureFlagsPromise;
+}
+
 const FONT_ID    = "slimy-cue-timer-font";
 const FONT_FACE  = "Orbitron";
 const MAX_HISTORY = 100;
@@ -242,6 +263,115 @@ function slimyGetNodeProgressPct() {
     return Math.max(rawNodePct, predictedNodePct);
 }
 
+
+// --- Desktop mirror ---------------------------------------------------------
+let _slimyMirrorLastPush = 0;
+let _slimyMirrorPushPending = false;
+
+function slimyMirrorSnapshot() {
+    const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
+    const node = nodes[0] || null;
+    return {
+        running: !!GlobalTimer.isRunning,
+        timer: node?._timerStr || "00:00:000",
+        step: Number(PeepState.samplerStep || 0),
+        step_total: Number(PeepState.samplerTotal || 0),
+        total_pct: Math.round(slimyGetNodeProgressPct() * 1000) / 10,
+        history: (node?.properties?.history || []).slice(0, 100),
+        timer_visible: node?.properties?.timerVisible !== false,
+        peep_visible: node?.properties?.peepVisible !== false,
+        peep_sound: node?.properties?.peepNotifySound !== false,
+        final_video: PeepState.finalVideo || null,
+    };
+}
+
+async function slimyMirrorPushState(force = false) {
+    const now = Date.now();
+    if (!force && now - _slimyMirrorLastPush < 100) {
+        if (!_slimyMirrorPushPending) {
+            _slimyMirrorPushPending = true;
+            setTimeout(() => {
+                _slimyMirrorPushPending = false;
+                slimyMirrorPushState(true);
+            }, 105);
+        }
+        return;
+    }
+    _slimyMirrorLastPush = now;
+    try {
+        await api.fetchApi("/slimy/cuetimer/mirror_state", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(slimyMirrorSnapshot()),
+        });
+    } catch (e) {}
+}
+
+let _slimyMirrorPullBusy = false;
+async function slimyMirrorPullControls() {
+    if (_slimyMirrorPullBusy) return;
+    _slimyMirrorPullBusy = true;
+    try {
+        const r = await api.fetchApi("/slimy/cuetimer/mirror_control", { cache: "no-store" });
+        if (!r?.ok) return;
+        const c = await r.json();
+        const hasPeepSound = typeof c?.peep_sound === "boolean";
+        const hasTimerVisible = typeof c?.timer_visible === "boolean";
+        if (!hasPeepSound && !hasTimerVisible) return;
+
+        const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
+        for (const node of nodes) {
+            node.properties = node.properties || {};
+
+            if (hasPeepSound && (node.properties.peepNotifySound !== false) !== c.peep_sound) {
+                node.properties.peepNotifySound = c.peep_sound;
+                node._slimyNotifySound = c.peep_sound;
+            }
+
+            // Same state change as the parent node's custom Timer checkbox.
+            if (hasTimerVisible && (node.properties.timerVisible !== false) !== c.timer_visible) {
+                node.properties.timerVisible = c.timer_visible;
+            }
+
+            node.setDirtyCanvas?.(true, false);
+        }
+        // Publish the applied parent-node value back as status immediately.
+        slimyMirrorPushState(true);
+    } catch (e) {
+    } finally {
+        _slimyMirrorPullBusy = false;
+    }
+}
+setInterval(slimyMirrorPullControls, 300);
+
+async function slimyMirrorPushPreviewBlob(blob, frameCount = 1) {
+    if (!(blob instanceof Blob)) return;
+    try {
+        await api.fetchApi("/slimy/cuetimer/mirror_preview", {
+            method: "POST",
+            headers: {
+                "Content-Type": blob.type || "application/octet-stream",
+                "X-Slimy-Frames": String(Math.max(1, Number(frameCount) || 1)),
+            },
+            body: blob,
+        });
+    } catch (e) {}
+}
+
+async function slimyMirrorPushPreviewDataUrl(src, frameCount = 1) {
+    if (typeof src !== "string" || !src.startsWith("data:")) return;
+    try {
+        const blob = await (await fetch(src)).blob();
+        await slimyMirrorPushPreviewBlob(blob, frameCount);
+    } catch (e) {}
+}
+
+async function slimyMirrorClearPreview() {
+    try {
+        await api.fetchApi("/slimy/cuetimer/mirror_preview_clear", { method: "POST" });
+    } catch (e) {}
+}
+
 // --- Notification & Sound ---
 const SlimyNotify = {
     _permissionRequested: false,
@@ -297,6 +427,33 @@ const SlimyNotify = {
         new Notification(title, { body, silent: true });
     },
 };
+
+// --- Email Notification ---
+// キュー完了/エラー時に、Emailチェックボックスが有効かつアドレスが設定されている
+// ノードの分だけ、サーバー側(/slimy/cuetimer/notify_email)経由でメールを送信する。
+// SMTP接続は行わずAPI経由で行うため、実際の送信はComfyUIサーバー側(__init__.py)が担う。
+async function slimySendEmailNotify(type, timeStr) {
+    if (!SLIMY_EMAIL_ENABLED) return;
+    const addrs = new Set();
+    for (const node of GlobalTimer.activeNodes) {
+        if (node.properties.emailNotifyEnabled && node.properties.emailAddress) {
+            addrs.add(String(node.properties.emailAddress).trim());
+        }
+    }
+    if (addrs.size === 0) return;
+    try {
+        const res = await api.fetchApi("/slimy/cuetimer/notify_email", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ to: [...addrs], status: type, elapsed: timeStr }),
+        });
+        if (!res.ok) {
+            console.warn("[Slimy_CueTimer] email notify failed:", await res.text());
+        }
+    } catch (err) {
+        console.warn("[Slimy_CueTimer] email notify failed:", err);
+    }
+}
 
 function playPeepPreviewBeep() {
     try {
@@ -374,6 +531,7 @@ const GlobalTimer = {
                 node._timerStr = t.str;
                 node.setDirtyCanvas(true, false);
             });
+            slimyMirrorPushState();
         }, 50);
         this.activeNodes.forEach(node => { node._running = true; });
     },
@@ -385,6 +543,7 @@ const GlobalTimer = {
         const finalTime = this.formatTime(Date.now() - this.startTime);
         const shouldNotify = [...this.activeNodes].some(n => n.properties.notifyEnabled !== false);
         if (shouldNotify) SlimyNotify.send(type, finalTime.str);
+        slimySendEmailNotify(type, finalTime.str);
         this.activeNodes.forEach(node => {
             node._timerStr = finalTime.str;
             node._running  = false;
@@ -398,6 +557,7 @@ const GlobalTimer = {
             node._scrollOffset = 0;
             node.setDirtyCanvas(true, false);
         });
+        slimyMirrorPushState(true);
     },
 
     registerNode(node)   { this.activeNodes.add(node); },
@@ -410,11 +570,13 @@ const SlimyCueTimerExtension = {
 
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== "Slimy_CueTimer") return;
+        await slimyLoadFeatureFlags();
 
         const origCreated   = nodeType.prototype.onNodeCreated;
         const origRemoved   = nodeType.prototype.onRemoved;
         const origSerialize = nodeType.prototype.onSerialize;
         const origConfigure = nodeType.prototype.onConfigure;
+        const origGetExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
 
         nodeType.prototype.onNodeCreated = function () {
             origCreated?.apply(this, arguments);
@@ -440,6 +602,9 @@ const SlimyCueTimerExtension = {
             if (this.properties.peepNotifySound === undefined) this.properties.peepNotifySound = true;
             if (this.properties.vramCleanupEnabled === undefined) this.properties.vramCleanupEnabled = true;
             if (this.properties.autoPlayEnabled === undefined) this.properties.autoPlayEnabled = true;
+            if (this.properties.emailNotifyEnabled === undefined) this.properties.emailNotifyEnabled = false;
+            if (this.properties.emailAddress === undefined) this.properties.emailAddress = "";
+            if (!SLIMY_EMAIL_ENABLED) this.properties.emailNotifyEnabled = false;
             // 旧バージョン(peepPreview / peepOnly)からのマイグレーション
             if (this.properties.timerVisible === undefined) {
                 this.properties.timerVisible = this.properties.peepOnly === true ? false : true;
@@ -449,6 +614,7 @@ const SlimyCueTimerExtension = {
             }
 
             GlobalTimer.registerNode(this);
+            setTimeout(() => slimyMirrorPushState(true), 0);
         };
 
         // --- Final video playback (native <video controls> = シークバー・再生時間・
@@ -689,17 +855,9 @@ const SlimyCueTimerExtension = {
             ctx.stroke();
             ctx.restore();
 
-            // ── Notify checkboxes (4つ・ノード幅にあわせて縮小してフィット) ──
+            // ── Notify checkboxes (ノード幅にあわせて縮小してフィット) ──
             const CB_LABELS   = ["systemNotify", "peepSound", "Timer", "Peep", "VRAM Clear", "AutoPlay"];
             const CB_COLORS   = ["#00ff22", "#4a9eff", "#f0a500", "#ff4fc4", "#ff6b3d", "#c084fc"];
-            const CB_FILL     = {
-                "#00ff22": "rgba(0,255,34,0.65)",
-                "#4a9eff": "rgba(74,158,255,0.75)",
-                "#f0a500": "rgba(240,165,0,0.8)",
-                "#ff4fc4": "rgba(255,79,196,0.8)",
-                "#ff6b3d": "rgba(255,107,61,0.8)",
-                "#c084fc": "rgba(192,132,252,0.8)",
-            };
             const CB_STATES   = [
                 this.properties.notifyEnabled !== false,
                 this.properties.peepNotifySound !== false,
@@ -708,6 +866,20 @@ const SlimyCueTimerExtension = {
                 this.properties.vramCleanupEnabled !== false,
                 this.properties.autoPlayEnabled !== false,
             ];
+            if (SLIMY_EMAIL_ENABLED) {
+                CB_LABELS.push("Email");
+                CB_COLORS.push("#00d4ff");
+                CB_STATES.push(!!this.properties.emailNotifyEnabled);
+            }
+            const CB_FILL     = {
+                "#00ff22": "rgba(0,255,34,0.65)",
+                "#4a9eff": "rgba(74,158,255,0.75)",
+                "#f0a500": "rgba(240,165,0,0.8)",
+                "#ff4fc4": "rgba(255,79,196,0.8)",
+                "#ff6b3d": "rgba(255,107,61,0.8)",
+                "#c084fc": "rgba(192,132,252,0.8)",
+                "#00d4ff": "rgba(0,212,255,0.8)",
+            };
 
             // 基準サイズ（フル幅時）でラベル幅を計測し、必要な総幅を求める
             const CB_SIZE_BASE = CB_SIZE_CONST;
@@ -772,12 +944,13 @@ const SlimyCueTimerExtension = {
                 w: CB_SIZE + 4 * cbScale + labelW + CB_HIT_PAD_X * 2,
                 h: CB_SIZE + CB_HIT_PAD_Y * 2
             });
-            this._cbRect        = cbHit(cbXs[0], labelWidths[0]);
-            this._peepCbRect    = cbHit(cbXs[1], labelWidths[1]);
+            this._cbRect         = cbHit(cbXs[0], labelWidths[0]);
+            this._peepCbRect     = cbHit(cbXs[1], labelWidths[1]);
             this._timerVisCbRect = cbHit(cbXs[2], labelWidths[2]);
             this._peepVisCbRect  = cbHit(cbXs[3], labelWidths[3]);
             this._vramCbRect     = cbHit(cbXs[4], labelWidths[4]);
             this._autoPlayCbRect = cbHit(cbXs[5], labelWidths[5]);
+            this._emailCbRect    = SLIMY_EMAIL_ENABLED ? cbHit(cbXs[6], labelWidths[6]) : null;
 
             // ── History area ─────────────────────────────────────────────
             if (showTimer) {
@@ -1070,6 +1243,7 @@ const SlimyCueTimerExtension = {
                     this.properties.peepNotifySound = this.properties.peepNotifySound === false;
                     this._slimyNotifySound = this.properties.peepNotifySound !== false;
                     this.setDirtyCanvas(true, false);
+                    slimyMirrorPushState(true);
                     return true;
                 }
             }
@@ -1079,6 +1253,7 @@ const SlimyCueTimerExtension = {
                 if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
                     this.properties.timerVisible = this.properties.timerVisible === false;
                     this.setDirtyCanvas(true, false);
+                    slimyMirrorPushState(true);
                     return true;
                 }
             }
@@ -1105,6 +1280,23 @@ const SlimyCueTimerExtension = {
                 const { x, y, w, h } = this._autoPlayCbRect;
                 if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
                     this.properties.autoPlayEnabled = this.properties.autoPlayEnabled === false;
+                    this.setDirtyCanvas(true, false);
+                    return true;
+                }
+            }
+
+            if (this._emailCbRect) {
+                const { x, y, w, h } = this._emailCbRect;
+                if (mx >= x && mx <= x + w && my >= y && my <= y + h) {
+                    const turningOn = !this.properties.emailNotifyEnabled;
+                    if (turningOn && !this.properties.emailAddress) {
+                        // アドレス未設定ならその場で入力を促す
+                        const input = window.prompt("通知先メールアドレスを入力してください:", "");
+                        const addr = (input || "").trim();
+                        if (!addr) { return true; } // 未入力ならONにしない
+                        this.properties.emailAddress = addr;
+                    }
+                    this.properties.emailNotifyEnabled = turningOn;
                     this.setDirtyCanvas(true, false);
                     return true;
                 }
@@ -1186,6 +1378,24 @@ const SlimyCueTimerExtension = {
             origRemoved?.apply(this, arguments);
         };
 
+        nodeType.prototype.getExtraMenuOptions = function (_graphCanvas, options) {
+            origGetExtraMenuOptions?.apply(this, arguments);
+            if (!SLIMY_EMAIL_ENABLED) return;
+            options.push({
+                content: this.properties.emailAddress
+                    ? `メール通知先を変更... (${this.properties.emailAddress})`
+                    : "メール通知先を設定...",
+                callback: () => {
+                    const input = window.prompt("通知先メールアドレスを入力してください（空欄で解除）:", this.properties.emailAddress || "");
+                    if (input === null) return; // キャンセル
+                    const addr = input.trim();
+                    this.properties.emailAddress = addr;
+                    if (!addr) this.properties.emailNotifyEnabled = false;
+                    this.setDirtyCanvas(true, false);
+                },
+            });
+        };
+
         nodeType.prototype.onSerialize = function (o) {
             origSerialize?.apply(this, arguments);
             o.properties = this.properties;
@@ -1200,6 +1410,9 @@ const SlimyCueTimerExtension = {
             if (this.properties.peepNotifySound === undefined) this.properties.peepNotifySound = true;
             if (this.properties.vramCleanupEnabled === undefined) this.properties.vramCleanupEnabled = true;
             if (this.properties.autoPlayEnabled === undefined) this.properties.autoPlayEnabled = true;
+            if (this.properties.emailNotifyEnabled === undefined) this.properties.emailNotifyEnabled = false;
+            if (this.properties.emailAddress === undefined) this.properties.emailAddress = "";
+            if (!SLIMY_EMAIL_ENABLED) this.properties.emailNotifyEnabled = false;
             if (this.properties.timerVisible === undefined) {
                 this.properties.timerVisible = this.properties.peepOnly === true ? false : true;
             }
@@ -1248,6 +1461,8 @@ const SlimyCueTimerExtension = {
                     node.setDirtyCanvas(true, true);
                 }
                 GlobalTimer.start();
+                slimyMirrorClearPreview();
+                slimyMirrorPushState(true);
             });
             api.addEventListener("executing",             ({ detail }) => {
                 if (detail === null) {
@@ -1281,6 +1496,7 @@ const SlimyCueTimerExtension = {
                 }
                 const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
                 for (const node of nodes) node.setDirtyCanvas(true, false);
+                slimyMirrorPushState();
             });
             api.addEventListener("execution_error",       ()           => { PeepState.pendingFinalVideo = null; PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); slimyMaybeClearVRAM(); });
             api.addEventListener("execution_interrupted", ()           => { PeepState.pendingFinalVideo = null; PeepState.predictedTotalMs = 0; GlobalTimer.stop("error"); slimyMaybeClearVRAM(); });
@@ -1293,6 +1509,7 @@ const SlimyCueTimerExtension = {
                 PeepState.customPreviewActive = true;
 
                 const frameCount = Math.max(1, Number(detail?.frames) || 1);
+                slimyMirrorPushPreviewDataUrl(src, frameCount);
                 const img = new Image();
                 img.onload = () => {
                     const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
@@ -1341,6 +1558,7 @@ const SlimyCueTimerExtension = {
                 if (PeepState.customPreviewActive) return;
                 const blob = detail instanceof Blob ? detail : null;
                 if (!blob) return;
+                slimyMirrorPushPreviewBlob(blob, 1);
 
                 const objectUrl = URL.createObjectURL(blob);
                 const img = new Image();
@@ -1366,6 +1584,7 @@ const SlimyCueTimerExtension = {
                 PeepState.samplerTotal = detail.max   ?? 0;
                 const nodes = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
                 for (const node of nodes) node.setDirtyCanvas(true, false);
+                slimyMirrorPushState();
             });
 
             // Upscaleサブツリーなどで動画保存ノードが複数あっても、

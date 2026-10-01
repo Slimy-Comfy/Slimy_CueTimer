@@ -49,6 +49,12 @@ Even when the preview is hidden, the progress bars and history remain visible.
 
 ------------------------------------------------------------------------
 
+### Desktop Widget (optional)
+
+`DesktopApp/CueTimerDesktop.exe` launches the Windows desktop widget. Keep `CueTimerDesktop.exe` and `CueTimerDesktop.ps1` in the same folder. The widget mirrors CueTimer progress/preview, can jump to an existing ComfyUI browser tab, and shows the final video when available.
+
+> The public GitHub build has the private Email feature disabled (`ENABLE_EMAIL = False`).
+
 ## Typical Uses
 
 - Monitoring long rendering jobs
@@ -78,3 +84,4 @@ Even when the preview is hidden, the progress bars and history remain visible.
 - PeepSound
 - AutoQueue
 - Elapsed time, remaining time, and processing speed display
+
