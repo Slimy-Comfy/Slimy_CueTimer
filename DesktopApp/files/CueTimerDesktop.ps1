@@ -1,4 +1,17 @@
 ﻿$script:logPath = Join-Path $PSScriptRoot 'CueTimerDesktop.log'
+
+# Privacy migration: remove legacy browser-tab debug lines from an existing log.
+# The ComfyUI tab finder still inspects tab titles in memory, but never persists them.
+try {
+    if (Test-Path $script:logPath) {
+        $legacyTabLogPattern = '^(=== ComfyUI TAB SCAN |\[BROWSER\]|\[TAB \d+\]|\[MATCH\] TAB |\[PERCENT CANDIDATE\] TAB |\[FALLBACK TITLE\]|\[PERCENT FALLBACK MATCH\] TAB )'
+        $lines = Get-Content -Path $script:logPath -Encoding UTF8
+        $filtered = @($lines | Where-Object { $_ -notmatch $legacyTabLogPattern })
+        if ($filtered.Count -ne $lines.Count) {
+            Set-Content -Path $script:logPath -Encoding UTF8 -Value $filtered
+        }
+    }
+} catch {}
 trap { try { ($_ | Out-String) | Set-Content -Encoding UTF8 $script:logPath } catch {} ; exit 1 }
 
 Add-Type -AssemblyName PresentationFramework
@@ -371,9 +384,6 @@ function Test-PercentFallbackTabName([string]$name) {
 
 function Focus-ComfyUITab {
     try {
-        try {
-            Add-Content -Path $script:logPath -Encoding UTF8 -Value ("`r`n=== ComfyUI TAB SCAN {0} ===" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'))
-        } catch {}
         $names = @('msedge','chrome','brave')
         $percentFallback = $null
 
@@ -388,21 +398,12 @@ function Focus-ComfyUITab {
                     [System.Windows.Automation.ControlType]::TabItem
                 )
                 $tabs = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
-                try {
-                    Add-Content -Path $script:logPath -Encoding UTF8 -Value ('[BROWSER] {0}  PID={1}  WindowTitle="{2}"  TabCount={3}' -f $proc.ProcessName, $proc.Id, ([string]$proc.MainWindowTitle), $tabs.Count)
-                } catch {}
                 for ($i = 0; $i -lt $tabs.Count; $i++) {
                     $tab = $tabs.Item($i)
                     $name = [string]$tab.Current.Name
-                    try {
-                        $autoId = [string]$tab.Current.AutomationId
-                        $className = [string]$tab.Current.ClassName
-                        Add-Content -Path $script:logPath -Encoding UTF8 -Value ('[TAB {0}] Name="{1}"  AutomationId="{2}"  ClassName="{3}"' -f $i, $name, $autoId, $className)
-                    } catch {}
 
-                    # Existing ComfyUI rules always win.
+                    # Existing ComfyUI rules always win. Tab titles are inspected only in memory and never logged.
                     if (Test-ComfyUITabName $name) {
-                        try { Add-Content -Path $script:logPath -Encoding UTF8 -Value ('[MATCH] TAB Name="{0}"' -f $name) } catch {}
                         $pat = $null
                         if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pat)) {
                             ([System.Windows.Automation.SelectionItemPattern]$pat).Select()
@@ -414,16 +415,14 @@ function Focus-ComfyUITab {
                         return $true
                     }
 
-                    # Remember only the first [*%] candidate. Do not open it yet.
+                    # Remember only the first [*%] candidate. Do not retain its title.
                     if ($null -eq $percentFallback -and (Test-PercentFallbackTabName $name)) {
-                        $percentFallback = [PSCustomObject]@{ Tab = $tab; Hwnd = $hwnd; Name = $name }
-                        try { Add-Content -Path $script:logPath -Encoding UTF8 -Value ('[PERCENT CANDIDATE] TAB Name="{0}"' -f $name) } catch {}
+                        $percentFallback = [PSCustomObject]@{ Tab = $tab; Hwnd = $hwnd }
                     }
                 }
 
-                # Existing safe fallback remains higher priority than [*%].
+                # Existing safe fallback remains higher priority than [*%]. Window title is not logged.
                 $title = [string]$proc.MainWindowTitle
-                try { Add-Content -Path $script:logPath -Encoding UTF8 -Value ('[FALLBACK TITLE] "{0}"' -f $title) } catch {}
                 if (Test-ComfyUITabName $title) {
                     if ([SlimyNative]::IsIconic($hwnd)) { [SlimyNative]::ShowWindowAsync($hwnd, 9) | Out-Null }
                     [SlimyNative]::SetForegroundWindow($hwnd) | Out-Null
@@ -435,7 +434,6 @@ function Focus-ComfyUITab {
 
         # Only after every existing rule failed, use a tab beginning with [<number>%].
         if ($null -ne $percentFallback) {
-            try { Add-Content -Path $script:logPath -Encoding UTF8 -Value ('[PERCENT FALLBACK MATCH] TAB Name="{0}"' -f $percentFallback.Name) } catch {}
             try {
                 $pat = $null
                 if ($percentFallback.Tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pat)) {
