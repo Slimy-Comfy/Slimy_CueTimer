@@ -36,6 +36,7 @@ const PEEP_PREVIEW_END_HOLD_FRAMES = 5;
 const PeepState = {
     samplerStep: 0,
     samplerTotal: 0,
+    renderSteps: null, // Executed sampler's "steps" widget, not progress.max
     nodesDone: 0,
     nodesTotal: 0,
     predictedTotalMs: 0,
@@ -47,6 +48,15 @@ const PeepState = {
 
 // --- Final video detection (executed イベントの output から動画/GIFらしきファイルを拾う) ---
 const SLIMY_VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|gif|webp)$/i;
+
+function slimyStepsFromExecutingNode(nodeId) {
+    const node = app.graph?.getNodeById?.(Number(nodeId));
+    if (!node) return null;
+    const widget = node.widgets?.find(w => String(w.name).toLowerCase() === "steps");
+    const steps = Number(widget?.value);
+    // A genuine diffusion step setting is a small positive integer.
+    return Number.isInteger(steps) && steps >= 1 && steps <= 200 ? steps : null;
+}
 
 function slimyExtractVideoAssets(output) {
     const found = [];
@@ -68,6 +78,47 @@ function slimyExtractVideoAssets(output) {
         }
     }
     return found;
+}
+
+// The final product is the newest video written to output/ during this run.
+// Nodes that save a file without announcing it in their UI output (e.g. a
+// side-by-side combine that only returns a path) never show up in "executed",
+// so relying on that alone showed the step before the final video.
+async function slimyResolveFinalVideo(fallback) {
+    try {
+        // ref = the last video the workflow announced. The server returns the newest
+        // video that is at least as new as it (works even if the final node was cached).
+        const q = new URLSearchParams();
+        if (fallback?.filename) {
+            q.set("ref_filename", fallback.filename);
+            q.set("ref_subfolder", fallback.subfolder || "");
+            q.set("ref_type", fallback.type || "output");
+        }
+        const res = await api.fetchApi(`/slimy/cuetimer/latest_video?${q.toString()}`, { cache: "no-store" });
+        if (res.ok) {
+            const data = await res.json();
+            if (data?.video?.filename) return data.video;
+        }
+    } catch (e) {}
+    return fallback || null;
+}
+
+async function slimyGetVideoMetadata(asset) {
+    if (!asset?.filename) return null;
+    try {
+        const q = new URLSearchParams({
+            filename: asset.filename,
+            subfolder: asset.subfolder || "",
+            type: asset.type || "output",
+        });
+        const res = await api.fetchApi(`/slimy/cuetimer/video_frames?${q}`, { cache: "no-store" });
+        if (!res.ok) return null;
+        const data = await res.json();
+        const validInt = value => Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : null;
+        return { frames: validInt(data?.frames), width: validInt(data?.width), height: validInt(data?.height) };
+    } catch (e) {
+        return null;
+    }
 }
 
 function slimyBuildViewUrl(asset) {
@@ -551,7 +602,8 @@ const GlobalTimer = {
             const hist = node.properties.history || [];
             const now = new Date();
             const stamp = `${now.getFullYear()}/${String(now.getMonth()+1).padStart(2,"0")}/${String(now.getDate()).padStart(2,"0")} ${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
-            hist.unshift({ time: finalTime.str, stamp, type });
+            const steps = PeepState.renderSteps;
+            hist.unshift({ time: finalTime.str, stamp, type, ...(steps ? { steps } : {}) });
             if (hist.length > MAX_HISTORY) hist.length = MAX_HISTORY;
             node.properties.history = hist;
             node._scrollOffset = 0;
@@ -995,10 +1047,14 @@ const SlimyCueTimerExtension = {
                 ctx.font      = `600 ${histFontS}px monospace`;
                 ctx.fillStyle = histColor;
                 ctx.textAlign = "left";
-                const displayStr = isError ? timeStr + " ⚠" : timeStr;
+                const frameStr = Number.isInteger(entry?.frames) && entry.frames > 0 ? `  ${entry.frames}f` : "";
+                const stepsStr = Number.isInteger(entry?.steps) && entry.steps > 0 ? `  ${entry.steps}step` : "";
+                const sizeStr = Number.isInteger(entry?.width) && Number.isInteger(entry?.height) ? `  ${entry.width}×${entry.height}` : "";
+                const displayStr = (isError ? timeStr + " ⚠" : timeStr) + frameStr + stepsStr + sizeStr;
                 ctx.fillText(displayStr, PAD, y);
 
-                if (stamp) {
+                // Keep the recorded timestamp, but do not draw it over metrics on narrow nodes.
+                if (stamp && PAD + ctx.measureText(displayStr).width + 8 + ctx.measureText(stamp).width < rightEdge) {
                     ctx.fillStyle = isError
                         ? `rgba(255,80,80,${stampAlpha})`
                         : `rgba(0,255,34,${stampAlpha})`;
@@ -1442,6 +1498,7 @@ const SlimyCueTimerExtension = {
                 PeepState.nodesTotal = 0;
                 PeepState.samplerStep = 0;
                 PeepState.samplerTotal = 0;
+                PeepState.renderSteps = null;
                 PeepState.customPreviewActive = false;
                 PeepState.frameCount = 1;
                 PeepState.currentPromptId = detail?.prompt_id ?? null;
@@ -1463,6 +1520,7 @@ const SlimyCueTimerExtension = {
                 GlobalTimer.start();
                 slimyMirrorClearPreview();
                 slimyMirrorPushState(true);
+                api.fetchApi("/slimy/cuetimer/run_mark", { method: "POST" }).catch(() => {});
             });
             api.addEventListener("executing",             ({ detail }) => {
                 if (detail === null) {
@@ -1474,11 +1532,32 @@ const SlimyCueTimerExtension = {
                         }
                     }
                     // 実行中に検出した動画は、キュー完了後にだけ表示する。
-                    if (PeepState.pendingFinalVideo) {
-                        PeepState.finalVideo = PeepState.pendingFinalVideo;
-                        for (const node of previewNodes) node._slimySetFinalVideo?.(PeepState.finalVideo);
-                    }
+                    // 最終動画は「今回の実行中にoutputへ最後に書かれた動画」をサーバーに
+                    // 問い合わせて決める(見つからなければexecutedで拾った候補)。
+                    const fallback = PeepState.pendingFinalVideo;
+                    const runId = PeepState.currentPromptId;
                     PeepState.pendingFinalVideo = null;
+                    slimyResolveFinalVideo(fallback).then(async (video) => {
+                        if (!video || PeepState.currentPromptId !== runId) return; // a newer run started
+                        PeepState.finalVideo = video;
+                        const nodesNow = app.graph?._nodes?.filter(n => n.type === "Slimy_CueTimer") || [];
+                        for (const node of nodesNow) node._slimySetFinalVideo?.(video);
+                        slimyMirrorPushState(true);
+                        const metadata = await slimyGetVideoMetadata(video);
+                        if (!metadata || PeepState.currentPromptId !== runId) return;
+                        for (const node of nodesNow) {
+                            const entry = node.properties?.history?.[0];
+                            if (entry?.type === "done" && entry.time === node.properties.elapsed_time_str) {
+                                if (metadata.frames) entry.frames = metadata.frames;
+                                if (metadata.width && metadata.height) {
+                                    entry.width = metadata.width;
+                                    entry.height = metadata.height;
+                                }
+                                node.setDirtyCanvas(true, false);
+                            }
+                        }
+                        slimyMirrorPushState(true);
+                    });
 
                     PeepState.nodesDone = 0;
                     PeepState.nodesTotal = 0;
@@ -1490,6 +1569,8 @@ const SlimyCueTimerExtension = {
                     // タイマー停止後にVRAMクリアを実行(いずれかのノードで有効な場合のみ)
                     slimyMaybeClearVRAM();
                 } else {
+                    const steps = slimyStepsFromExecutingNode(detail);
+                    if (steps !== null) PeepState.renderSteps = steps;
                     PeepState.nodesDone += 1;
                     if (PeepState.nodesTotal === 0) PeepState.nodesTotal = app.graph?._nodes?.length ?? 1;
                     if (PeepState.nodesDone > PeepState.nodesTotal) PeepState.nodesTotal = PeepState.nodesDone;

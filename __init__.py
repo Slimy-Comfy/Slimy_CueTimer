@@ -179,6 +179,182 @@ async def slimy_cuetimer_mirror_preview_get(request):
     return web.Response(body=_CUETIMER_MIRROR_PREVIEW, content_type=_CUETIMER_MIRROR_PREVIEW_CONTENT_TYPE)
 
 
+# ---------------------------------------------------------------------------
+# Final video = the newest video file written to output/ during this run
+# ---------------------------------------------------------------------------
+# The browser used to take the last video announced in an "executed" event.
+# Nodes that save a file but don't put it in their UI output (e.g. a final
+# side-by-side combine that only returns a path) are invisible that way, so the
+# previous video (one of the spools' combined clips) was shown instead.
+# The file system doesn't have that blind spot: the final product is simply the
+# last video written during the run.
+_RUN_STARTED_AT = 0.0
+_FINAL_SCAN_EXT = (".mp4", ".webm", ".mov", ".mkv")   # real videos only (no gif/webp stills)
+
+
+@PromptServer.instance.routes.post("/slimy/cuetimer/run_mark")
+async def slimy_cuetimer_run_mark(request):
+    """Called by the browser at execution_start. Uses the SERVER clock, so a
+    browser on another PC with a different clock doesn't matter."""
+    global _RUN_STARTED_AT
+    import time
+    _RUN_STARTED_AT = time.time()
+    _print_run_banner(_RUN_STARTED_AT)
+    return web.json_response({"ok": True, "started_at": _RUN_STARTED_AT})
+
+
+# Console banner at the moment the CueTimer starts counting from 0, so the start of
+# each run is easy to find in the log. ASCII only (a Japanese Windows console, cp932,
+# cannot print block characters).
+_BANNER_STYLE = "\033[1;97;45m"  # bold, white on magenta
+_BANNER_RESET = "\033[0m"
+if os.name == "nt":
+    try:
+        os.system("")  # turn on ANSI escape handling in the Windows console
+    except Exception:
+        pass
+
+
+def _print_run_banner(t):
+    try:
+        import time
+        print(f"{_BANNER_STYLE}######## RUN START {time.strftime('%H:%M:%S', time.localtime(t))} ########{_BANNER_RESET}",
+              flush=True)
+    except Exception:
+        pass
+
+
+def _is_intermediate(name, rel_dir):
+    lower = name.lower()
+    if lower.startswith("chunk_") or "_thumb." in lower:
+        return True  # VideoSpooler chunks / thumbnails
+    top = rel_dir.replace("\\", "/").split("/", 1)[0].lower()
+    return top.startswith("slimy_spool")  # spool working folders
+
+
+def _find_latest_video(since):
+    base = folder_paths.get_output_directory()
+    best = None  # (mtime, rel_dir, name)
+    for root, dirs, files in os.walk(base):
+        rel_dir = os.path.relpath(root, base)
+        rel_dir = "" if rel_dir == "." else rel_dir
+        if rel_dir and _is_intermediate("", rel_dir):
+            dirs[:] = []   # don't descend into spool folders
+            continue
+        for name in files:
+            if not name.lower().endswith(_FINAL_SCAN_EXT) or _is_intermediate(name, rel_dir):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(root, name))
+            except OSError:
+                continue
+            if mtime + 1.0 < since:   # 1 s slack for coarse file-system timestamps
+                continue
+            if best is None or mtime > best[0]:
+                best = (mtime, rel_dir, name)
+    if best is None:
+        return None
+    return {"filename": best[2], "subfolder": best[1].replace("\\", "/"), "type": "output"}
+
+
+def _asset_mtime(filename, subfolder, file_type):
+    if not filename:
+        return None
+    get_dir = _TYPE_TO_DIR.get(file_type or "output", folder_paths.get_output_directory)
+    path = os.path.join(get_dir(), subfolder or "", filename)
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+@PromptServer.instance.routes.get("/slimy/cuetimer/latest_video")
+async def slimy_cuetimer_latest_video(request):
+    """Newest video in output/ that is at least as new as `ref` (the last video
+    the workflow announced). Anchoring on that file instead of on the run start
+    keeps working when the final combine node is CACHED: no new file is written
+    this run, but the final product written last time is still newer than the
+    spool clip the workflow announced, so it is still the one picked.
+    Without a usable ref, falls back to "written during this run"."""
+    q = request.query
+    since = None
+    ref_mtime = _asset_mtime(q.get("ref_filename"), q.get("ref_subfolder"), q.get("ref_type"))
+    if ref_mtime is not None:
+        since = ref_mtime
+    elif _RUN_STARTED_AT > 0:
+        since = _RUN_STARTED_AT
+    if since is None:
+        return web.json_response({"video": None})
+    try:
+        video = await asyncio.to_thread(_find_latest_video, since)
+    except Exception as e:
+        print(f"[Slimy_CueTimer] latest video scan failed: {e}")
+        video = None
+    return web.json_response({"video": video})
+
+
+def _video_metadata(path):
+    """Read encoded frame count and output dimensions without decoding frames."""
+    metadata = {"frames": None, "width": None, "height": None}
+    try:
+        import cv2
+        cap = cv2.VideoCapture(path)
+        try:
+            if cap.isOpened():
+                count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                if count > 0:
+                    metadata["frames"] = count
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if width > 0 and height > 0:
+                    metadata.update(width=width, height=height)
+        finally:
+            cap.release()
+    except Exception:
+        pass
+    if all(metadata.values()):
+        return metadata
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-count_packets", "-show_entries", "stream=nb_read_packets,nb_frames,width,height",
+             "-of", "json", path], capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for stream in json.loads(result.stdout).get("streams", []):
+                for field in ("nb_frames", "nb_read_packets"):
+                    value = stream.get(field)
+                    if not metadata["frames"] and value and str(value).isdigit() and int(value) > 0:
+                        metadata["frames"] = int(value)
+                for field in ("width", "height"):
+                    value = stream.get(field)
+                    if not metadata[field] and value and str(value).isdigit() and int(value) > 0:
+                        metadata[field] = int(value)
+    except Exception:
+        pass
+    return metadata
+
+
+@PromptServer.instance.routes.get("/slimy/cuetimer/video_frames")
+async def slimy_cuetimer_video_frames(request):
+    q = request.query
+    filename = q.get("filename", "")
+    subfolder = q.get("subfolder", "")
+    file_type = q.get("type", "output")
+    if not filename or not filename.lower().endswith(_FINAL_SCAN_EXT):
+        return web.json_response({"frames": None, "width": None, "height": None})
+    base = os.path.realpath(_TYPE_TO_DIR.get(file_type, folder_paths.get_output_directory)())
+    path = os.path.realpath(os.path.join(base, subfolder, filename))
+    try:
+        valid = os.path.commonpath([base, path]) == base and os.path.isfile(path)
+    except ValueError:
+        valid = False
+    if not valid:
+        return web.json_response({"frames": None, "width": None, "height": None})
+    metadata = await asyncio.to_thread(_video_metadata, path)
+    return web.json_response(metadata)
+
+
 @PromptServer.instance.routes.post("/slimy/cuetimer/mirror_preview_clear")
 async def slimy_cuetimer_mirror_preview_clear(request):
     global _CUETIMER_MIRROR_PREVIEW, _CUETIMER_MIRROR_PREVIEW_CONTENT_TYPE
@@ -284,7 +460,10 @@ function renderHistory(h){
     if(typeof x==='string') return `<div class="hrow">${esc(x)}</div>`;
     const cls=x?.type==='error'?'err':(x?.type==='running'?'run':'done');
     const a=x?.time||x?.stamp||''; const b=x?.label||x?.name||x?.type||'';
-    return `<div class="hrow ${cls}">${esc(a)} ${esc(b)}</div>`;
+    const frames=Number.isInteger(x?.frames)&&x.frames>0?` ${x.frames}f`:'';
+    const steps=Number.isInteger(x?.steps)&&x.steps>0?` ${x.steps}step`:'';
+    const size=Number.isInteger(x?.width)&&Number.isInteger(x?.height)?` ${x.width}×${x.height}`:'';
+    return `<div class="hrow ${cls}">${esc(a)}${esc(frames)}${esc(steps)}${esc(size)} ${esc(b)}</div>`;
   }).join('');
 }
 async function tick(){

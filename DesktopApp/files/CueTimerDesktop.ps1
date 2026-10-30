@@ -12,6 +12,9 @@ try {
         }
     }
 } catch {}
+# Shown as the status-text tooltip and logged at startup, so it is always clear
+# WHICH script file the exe actually ran (it runs DesktopApp\files\CueTimerDesktop.ps1).
+$script:buildTag = 'CueTimerDesktop.ps1 2026-10-16 fit-measured'
 trap { try { ($_ | Out-String) | Set-Content -Encoding UTF8 $script:logPath } catch {} ; exit 1 }
 
 Add-Type -AssemblyName PresentationFramework
@@ -50,6 +53,7 @@ public static class SlimyNative {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
 }
@@ -64,7 +68,7 @@ public static class SlimyNative {
   <Border Background="#111318" BorderBrush="#2c313d" BorderThickness="1" CornerRadius="8" Padding="10">
     <Grid>
       <Grid.RowDefinitions>
-        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto" MinHeight="32"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="6"/>
         <RowDefinition Height="Auto"/>
@@ -93,8 +97,9 @@ public static class SlimyNative {
                    VerticalAlignment="Center" HorizontalAlignment="Center"/>
       </Button>
 
-      <StackPanel x:Name="TimerPanel" Grid.Row="0" Orientation="Horizontal" HorizontalAlignment="Center"
-                  VerticalAlignment="Center" Margin="0,0,0,5"
+      <Viewbox x:Name="TimerBox" Grid.Row="0" Stretch="Uniform" StretchDirection="DownOnly"
+               HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,0,0,5">
+      <StackPanel x:Name="TimerPanel" Orientation="Horizontal"
                   TextOptions.TextFormattingMode="Display">
         <StackPanel.Effect>
           <DropShadowEffect Color="#00FF66" BlurRadius="9" ShadowDepth="0" Opacity="0.58"/>
@@ -110,12 +115,20 @@ public static class SlimyNative {
         <TextBlock x:Name="TimerPart3" Text="000" Width="86" TextAlignment="Center" VerticalAlignment="Center"
                    Foreground="#00FF66" FontFamily="Orbitron, Consolas" FontSize="34" FontWeight="SemiBold"/>
       </StackPanel>
+      </Viewbox>
 
-      <StackPanel x:Name="StatsPanel" Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,0,0,6">
-        <TextBlock x:Name="StepsText" Text="Steps 0 / 0" Foreground="#74DFA0" FontFamily="Orbitron, Consolas" FontSize="13"/>
-        <TextBlock Text="  •  " Foreground="#4E9D6B" FontFamily="Orbitron, Consolas" FontSize="13"/>
-        <TextBlock x:Name="PctText" Text="0%" Foreground="#74DFA0" FontFamily="Orbitron, Consolas" FontSize="13"/>
-      </StackPanel>
+      <Viewbox x:Name="StatsBox" Grid.Row="1" Stretch="Uniform" StretchDirection="DownOnly"
+               HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,0,0,6">
+      <Grid>
+        <StackPanel x:Name="StatsPanel" Orientation="Horizontal">
+          <TextBlock x:Name="StepsText" Text="Steps 0 / 0" Foreground="#74DFA0" FontFamily="Orbitron, Consolas" FontSize="13"/>
+          <TextBlock Text="  •  " Foreground="#4E9D6B" FontFamily="Orbitron, Consolas" FontSize="13"/>
+          <TextBlock x:Name="PctText" Text="0%" Foreground="#74DFA0" FontFamily="Orbitron, Consolas" FontSize="13"/>
+        </StackPanel>
+        <TextBlock x:Name="ResultMetrics" Visibility="Collapsed" Foreground="#74DFA0"
+                   FontFamily="Orbitron, Consolas" FontSize="13" TextAlignment="Center"/>
+      </Grid>
+      </Viewbox>
 
       <ProgressBar x:Name="Progress" Grid.Row="2" Minimum="0" Maximum="100" Value="0" Height="6"
                    VerticalAlignment="Stretch" BorderThickness="0" Background="#18231D" Foreground="#00D95A"/>
@@ -136,10 +149,16 @@ public static class SlimyNative {
         <Grid>
           <Image x:Name="PreviewImage" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
           <MediaElement x:Name="FinalVideo" Stretch="Uniform" Visibility="Collapsed"
-                        LoadedBehavior="Manual" UnloadedBehavior="Manual" ScrubbingEnabled="True"
+                        LoadedBehavior="Manual" UnloadedBehavior="Manual" ScrubbingEnabled="False"
                         IsMuted="True"/>
           <TextBlock x:Name="NoPreview" Text="Waiting for CueTimer preview…" Foreground="#687386" FontSize="13"
                      HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          <Border x:Name="PauseBadge" Visibility="Collapsed" IsHitTestVisible="False"
+                  HorizontalAlignment="Center" VerticalAlignment="Center"
+                  Width="54" Height="54" CornerRadius="27" Background="#99000000">
+            <TextBlock Text="❚❚" Foreground="#E6EAF0" FontSize="20" FontWeight="Bold"
+                       HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-2,0,0"/>
+          </Border>
         </Grid>
       </Border>
 
@@ -165,6 +184,9 @@ public static class SlimyNative {
 $reader = [System.Xml.XmlNodeReader]::new($xaml)
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $timerPanel = $window.FindName('TimerPanel')
+$timerBox = $window.FindName('TimerBox')
+$statsBox = $window.FindName('StatsBox')
+$resultMetrics = $window.FindName('ResultMetrics')
 $timerPart1 = $window.FindName('TimerPart1')
 $timerPart2 = $window.FindName('TimerPart2')
 $timerPart3 = $window.FindName('TimerPart3')
@@ -178,6 +200,7 @@ $previewWrap = $window.FindName('PreviewWrap')
 $previewImage = $window.FindName('PreviewImage')
 $finalVideo = $window.FindName('FinalVideo')
 $noPreview = $window.FindName('NoPreview')
+$pauseBadge = $window.FindName('PauseBadge')
 $statusText = $window.FindName('StatusText')
 $timerToggle = $window.FindName('TimerToggle')
 $previewToggle = $window.FindName('PreviewToggle')
@@ -190,6 +213,8 @@ $miniButtonText = $window.FindName('MiniButtonText')
 $restoreIcon = $window.FindName('RestoreIcon')
 $controlsPanel = $window.FindName('ControlsPanel')
 $bottomPanel = $window.FindName('BottomPanel')
+try { $statusText.ToolTip = $script:buildTag + "`n" + $PSCommandPath } catch {}
+try { ('{0} started {1} from {2}' -f (Get-Date -Format o), $script:buildTag, $PSCommandPath) | Add-Content -Encoding UTF8 $script:logPath } catch {}
 
 # Remove standard chrome but preserve native resize behavior.
 $chrome = [System.Windows.Shell.WindowChrome]::new()
@@ -225,17 +250,79 @@ $script:restoreMinWidth = 160.0
 $script:restoreMinHeight = 190.0
 $script:restoreLeft = [double]::NaN
 $script:restoreTop = [double]::NaN
+# Final video playback: the user's click choice, and what the MediaElement is doing now.
+$script:userPaused = $false
+$script:videoPlaying = $false
+$script:clickToggledAt = [DateTime]::MinValue
+# Own double-click detection for the non-preview area (DragMove() swallows ClickCount).
+$script:lastBlankClickAt = [DateTime]::MinValue
+$script:lastBlankClickX = 0.0
+$script:lastBlankClickY = 0.0
+# Poll intervals: normal vs. minimized (nothing visible, only keep state roughly fresh).
+$script:pollActiveMs = 250
+$script:pollIdleMs = 2000
 
-# Match the parent CueTimer behavior: timer typography follows available width.
-# 430 px is the desktop widget's reference width; below that, shrink continuously.
+# Timer digit sizes for a given scale. $tight lowers the minimum sizes so the
+# timer can keep shrinking when the window is very narrow.
+function Get-TimerMetrics([double]$sc, [bool]$tight) {
+    $fMin  = if ($tight) { 7.0 }  else { 10.0 }
+    $pMin  = if ($tight) { 12.0 } else { 22.0 }
+    $p3Min = if ($tight) { 17.0 } else { 30.0 }
+    $cMin  = if ($tight) { 4.0 }  else { 8.0 }
+    $font  = [Math]::Max($fMin, 34.0 * $sc)
+    $part  = [Math]::Max($pMin, 62.0 * $sc)
+    $part3 = [Math]::Max($p3Min, 86.0 * $sc)
+    $colon = [Math]::Max($cMin, 18.0 * $sc)
+    return [PSCustomObject]@{
+        Font = $font; Part = $part; Part3 = $part3; Colon = $colon
+        Total = (2.0 * $part + $part3 + 2.0 * $colon)
+    }
+}
+
+# ── Top rows layout (normal size) ─────────────────────────────────────────────
+# Everything here is MEASURED from the live elements instead of predicted from
+# hard-coded sizes, so fonts / DPI / glyph widths can't make the rows run under
+# the top-right buttons. Each row sits in a DownOnly Viewbox: it stays centered
+# while there is room, slides left as the window narrows, and is scaled down as a
+# whole (real rendered size) when it still doesn't fit.
+
+# Width the top-right buttons cover, measured from the real buttons, plus a gap.
+function Get-ButtonReserve {
+    $r = 0.0
+    foreach ($b in @($miniButton, $closeButton)) {
+        if ($null -eq $b -or $b.Visibility -ne [System.Windows.Visibility]::Visible) { continue }
+        $bw = [double]$b.ActualWidth
+        if ($bw -le 0) { $bw = [double]$b.Width }
+        $r = [Math]::Max($r, $bw + [double]$b.Margin.Right)
+    }
+    return ($r + 6.0)
+}
+
+# Fit one row (Viewbox + its panel) next to the buttons.
+function Set-RowFit($box, $panel, [double]$contentW, [double]$reserve, [double]$bottom) {
+    $panel.Measure([System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity))
+    $natural = [double]$panel.DesiredSize.Width          # real unscaled width
+    $avail = [Math]::Max(20.0, $contentW - $reserve)     # room left of the buttons
+    $box.MaxWidth = $avail                               # Viewbox shrinks the row past this
+    $eff = [Math]::Min($natural, $avail)
+    # Right margin moves the centered row left only as far as needed (0 when it fits):
+    # its right edge then lands exactly at the buttons' left edge minus the gap.
+    $shift = [Math]::Max(0.0, $eff - $contentW + 2.0 * $reserve)
+    $box.HorizontalAlignment = 'Center'
+    $box.Margin = [System.Windows.Thickness]::new(0, 0, $shift, $bottom)
+}
+
+# Timer typography follows available width (430 px = reference width).
 function Update-ResponsiveTypography {
     try {
         $w = [double]$window.ActualWidth
         if ($w -le 0) { $w = [double]$window.Width }
         if ($script:isMini) {
+            # Compact layout: unchanged (already good).
             foreach ($tb in @($timerPart1,$timerColon1,$timerPart2,$timerColon2,$timerPart3)) { if ($tb) { $tb.FontSize = 20.0 } }
-            $timerPanel.HorizontalAlignment = 'Left'
-            $timerPanel.Margin = [System.Windows.Thickness]::new(4,0,0,0)
+            $timerBox.MaxWidth = [double]::PositiveInfinity
+            $timerBox.HorizontalAlignment = 'Left'
+            $timerBox.Margin = [System.Windows.Thickness]::new(4,0,0,0)
             $timerPart1.Width = 44.0
             $timerPart2.Width = 44.0
             $timerPart3.Width = 58.0
@@ -244,18 +331,27 @@ function Update-ResponsiveTypography {
             return
         }
         $scale = [Math]::Min(1.0, [Math]::Max(0.25, $w / 430.0))
-        $timerFontSize = [Math]::Max(10.0, 34.0 * $scale)
-        foreach ($tb in @($timerPart1,$timerColon1,$timerPart2,$timerColon2,$timerPart3)) { if ($tb) { $tb.FontSize = $timerFontSize } }
-        $timerPanel.HorizontalAlignment = 'Center'
-        $timerPanel.Margin = [System.Windows.Thickness]::new(0,0,0,5)
-        $timerPart1.Width = [Math]::Max(22.0, 62.0 * $scale)
-        $timerPart2.Width = [Math]::Max(22.0, 62.0 * $scale)
-        $timerPart3.Width = [Math]::Max(30.0, 86.0 * $scale)
-        $timerColon1.Width = [Math]::Max(8.0, 18.0 * $scale)
-        $timerColon2.Width = [Math]::Max(8.0, 18.0 * $scale)
+        $m = Get-TimerMetrics $scale $false
+        foreach ($tb in @($timerPart1,$timerColon1,$timerPart2,$timerColon2,$timerPart3)) { if ($tb) { $tb.FontSize = $m.Font } }
+        $timerPart1.Width = $m.Part
+        $timerPart2.Width = $m.Part
+        $timerPart3.Width = $m.Part3
+        $timerColon1.Width = $m.Colon
+        $timerColon2.Width = $m.Colon
         $stepsText.FontSize = [Math]::Max(8.0, 13.0 * $scale)
         $pctText.FontSize = [Math]::Max(8.0, 13.0 * $scale)
-    } catch {}
+        $resultMetrics.FontSize = [Math]::Max(8.0, 13.0 * $scale)
+
+        # Real content width = the Grid both rows live in (window minus border/padding).
+        $grid = $timerBox.Parent
+        $contentW = if ($grid -and $grid.ActualWidth -gt 0) { [double]$grid.ActualWidth } else { [Math]::Max(1.0, $w - 22.0) }
+        $reserve = Get-ButtonReserve
+        Set-RowFit $timerBox $timerPanel $contentW $reserve 5.0
+        $visibleStats = if ($resultMetrics.Visibility -eq [System.Windows.Visibility]::Visible) { $resultMetrics } else { $statsPanel }
+        Set-RowFit $statsBox $visibleStats $contentW $reserve 6.0
+    } catch {
+        try { ('Layout failed: ' + $_.Exception.Message) | Add-Content -Encoding UTF8 $script:logPath } catch {}
+    }
 }
 
 
@@ -272,7 +368,7 @@ function Set-MiniMode([bool]$enable) {
             $script:restoreTop = [double]$window.Top
 
             $script:isMini = $true
-            $statsPanel.Visibility = 'Collapsed'
+            $statsBox.Visibility = 'Collapsed'
             $progress.Visibility = 'Collapsed'
             $controlsPanel.Visibility = 'Collapsed'
             $previewWrap.Visibility = 'Collapsed'
@@ -294,6 +390,7 @@ function Set-MiniMode([bool]$enable) {
             $miniButtonText.Visibility = 'Collapsed'
             if ($restoreIcon) { $restoreIcon.Visibility = 'Visible' }
             Update-ResponsiveTypography
+            Update-IdleMode
         } else {
             $script:isMini = $false
 
@@ -320,6 +417,7 @@ function Set-MiniMode([bool]$enable) {
             $miniButtonText.Text = '−'
             $miniButtonText.FontSize = 20
             Update-ResponsiveTypography
+            Update-IdleMode
         }
     } catch {
         try { ('Mini mode failed: ' + $_.Exception.Message) | Add-Content -Encoding UTF8 $script:logPath } catch {}
@@ -349,11 +447,34 @@ function Update-TimerVisibility {
 
     $timerPanel.Visibility = if ($showTimer) { 'Visible' } else { 'Collapsed' }
     if ($script:isMini) {
-        $statsPanel.Visibility = 'Collapsed'
+        $statsBox.Visibility = 'Collapsed'
         $progress.Visibility = 'Collapsed'
     } else {
-        $statsPanel.Visibility = if ($showTimer) { 'Visible' } else { 'Collapsed' }
+        $statsBox.Visibility = if ($showTimer) { 'Visible' } else { 'Collapsed' }
         $progress.Visibility = if ($showTimer) { 'Visible' } else { 'Collapsed' }
+    }
+}
+
+function Update-ResultMetrics($state) {
+    $parts = [System.Collections.Generic.List[string]]::new()
+    if (-not [bool]$state.running -and $state.history -and $state.history.Count -gt 0) {
+        $entry = $state.history[0]
+        if ($entry.type -eq 'done') {
+            if ([int]$entry.frames -gt 0) { $parts.Add(('{0}f' -f [int]$entry.frames)) }
+            if ([int]$entry.steps -gt 0) { $parts.Add(('{0}step' -f [int]$entry.steps)) }
+            if ([int]$entry.width -gt 0 -and [int]$entry.height -gt 0) {
+                $parts.Add(('{0}×{1}' -f [int]$entry.width, [int]$entry.height))
+            }
+        }
+    }
+    $nextText = $parts -join '  |  '
+    $showResult = -not [string]::IsNullOrEmpty($nextText)
+    $nextVisibility = if ($showResult) { 'Visible' } else { 'Collapsed' }
+    if ($resultMetrics.Text -ne $nextText -or $resultMetrics.Visibility.ToString() -ne $nextVisibility) {
+        $resultMetrics.Text = $nextText
+        $resultMetrics.Visibility = $nextVisibility
+        $statsPanel.Visibility = if ($showResult) { 'Collapsed' } else { 'Visible' }
+        Update-ResponsiveTypography
     }
 }
 
@@ -361,6 +482,60 @@ function Update-PreviewVisibility {
     $localOn = $true
     if ($previewToggle -and $null -ne $previewToggle.IsChecked) { $localOn = [bool]$previewToggle.IsChecked }
     $previewWrap.Visibility = if ((-not $script:isMini) -and $localOn -and $script:remotePeepVisible) { 'Visible' } else { 'Collapsed' }
+    Update-VideoPlayback
+}
+
+# True only when the preview area can actually be seen. When it can't
+# (minimized / mini mode / Peep off) we skip video decoding, preview downloads
+# and the frame-flip animation, which is where the widget's CPU/GPU goes.
+function Test-PreviewNeeded {
+    if ($window.WindowState -eq [System.Windows.WindowState]::Minimized) { return $false }
+    if ($script:isMini) { return $false }
+    return ($previewWrap.Visibility -eq [System.Windows.Visibility]::Visible)
+}
+
+# Single place that decides whether the final video decodes or sits paused.
+function Update-VideoPlayback {
+    if (-not $finalVideo) { return }
+    if (-not $script:hasFinalVideo) {
+        $script:videoPlaying = $false
+        if ($pauseBadge) { $pauseBadge.Visibility = 'Collapsed' }
+        return
+    }
+    $shouldPlay = (Test-PreviewNeeded) -and (-not $script:userPaused)
+    try {
+        if ($shouldPlay -and -not $script:videoPlaying) {
+            $finalVideo.Play()
+            $script:videoPlaying = $true
+        } elseif (-not $shouldPlay -and $script:videoPlaying) {
+            $finalVideo.Pause()
+            $script:videoPlaying = $false
+        }
+    } catch {}
+    if ($pauseBadge) {
+        $pauseBadge.Visibility = if ($script:userPaused) { 'Visible' } else { 'Collapsed' }
+    }
+}
+
+function Switch-VideoPause {
+    if (-not $script:hasFinalVideo) { return $false }
+    $script:userPaused = -not $script:userPaused
+    Update-VideoPlayback
+    return $true
+}
+
+function Update-IdleMode {
+    # Minimized: slow polling and stop the flip animation entirely.
+    $minimized = ($window.WindowState -eq [System.Windows.WindowState]::Minimized)
+    $ms = if ($minimized) { $script:pollIdleMs } else { $script:pollActiveMs }
+    if ($pollTimer -and $pollTimer.Interval.TotalMilliseconds -ne $ms) {
+        $pollTimer.Interval = [TimeSpan]::FromMilliseconds($ms)
+    }
+    if ($flipTimer) {
+        if (Test-PreviewNeeded) { if (-not $flipTimer.IsEnabled) { $flipTimer.Start() } }
+        elseif ($flipTimer.IsEnabled) { $flipTimer.Stop() }
+    }
+    Update-VideoPlayback
 }
 
 function Test-ComfyUITabName([string]$name) {
@@ -486,6 +661,9 @@ function Clear-FinalVideo {
     $finalVideo.Visibility = 'Collapsed'
     $script:finalVideoKey = ''
     $script:hasFinalVideo = $false
+    $script:videoPlaying = $false
+    $script:userPaused = $false
+    if ($pauseBadge) { $pauseBadge.Visibility = 'Collapsed' }
 }
 
 function Set-FinalVideo($asset) {
@@ -505,8 +683,13 @@ function Set-FinalVideo($asset) {
         $noPreview.Visibility = 'Collapsed'
         $script:finalVideoKey = $key
         $script:hasFinalVideo = $true
+        $script:userPaused = $false   # a new render always starts playing
+        $script:videoPlaying = $false
         $finalVideo.Position = [TimeSpan]::Zero
-        $finalVideo.Play()
+        # Paused (not playing) when nothing is visible: shows the first frame on
+        # restore without decoding the whole loop in the background meanwhile.
+        $finalVideo.Pause()
+        Update-VideoPlayback
     } catch {
         try { ('Final video load failed: ' + $_.Exception.Message) | Add-Content -Encoding UTF8 $script:logPath } catch {}
     }
@@ -602,7 +785,7 @@ if ($finalVideo) {
     $finalVideo.Add_MediaEnded({
         try {
             $finalVideo.Position = [TimeSpan]::Zero
-            $finalVideo.Play()
+            if ($script:videoPlaying) { $finalVideo.Play() }
         } catch {}
     })
     $finalVideo.Add_MediaFailed({
@@ -615,6 +798,7 @@ $flipTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $flipTimer.Interval = [TimeSpan]::FromMilliseconds(240)
 $flipTimer.Add_Tick({
     if ($script:hasFinalVideo -or !$script:isRunning -or $null -eq $script:previewBitmap -or $script:previewFrames -le 1) { return }
+    if (-not (Test-PreviewNeeded)) { return }
     $last = $script:previewFrames - 1
     if ($script:previewIndex -ge $last) {
         $script:endHoldTicks++
@@ -678,6 +862,9 @@ $window.Add_SourceInitialized({
 })
 
 $window.Add_SizeChanged({ Update-ResponsiveTypography })
+# Minimize / restore: drop to near-idle while minimized, resume on restore.
+$window.Add_StateChanged({ Update-IdleMode })
+if ($previewWrap) { $previewWrap.ToolTip = 'Click: play / pause video   Double-click: mini mode' }
 $window.Add_Loaded({ Update-ResponsiveTypography })
 
 $pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
@@ -698,6 +885,7 @@ $pollTimer.Add_Tick({
         $p = [Math]::Max(0, [Math]::Min(100, [double]$s.total_pct))
         $pctText.Text = ('{0:0}%' -f $p)
         $progress.Value = $p
+        Update-ResultMetrics $s
 
         $remoteTimerVisible = ($s.timer_visible -ne $false)
         if ($null -ne $script:pendingTimerVisible) {
@@ -751,7 +939,9 @@ $pollTimer.Add_Tick({
             $previewImage.Source = $null
             $noPreview.Visibility = 'Visible'
             Update-StatusText 'normal'
-        } elseif ($ver -ne $script:lastPreviewVersion) {
+        } elseif ($ver -ne $script:lastPreviewVersion -and (Test-PreviewNeeded)) {
+            # (Skipped while the preview can't be seen; lastPreviewVersion stays
+            # behind, so the newest image is fetched as soon as it is visible again.)
             # Retry the same version after a transient HTTP/decode failure.
             $now = [DateTime]::UtcNow
             if (($now - $script:lastPreviewAttempt).TotalMilliseconds -ge 700) {
@@ -823,7 +1013,25 @@ $window.Add_PreviewMouseLeftButtonDown({
         }
         if ($inPreview -and $e.ClickCount -ge 2) {
             $e.Handled = $true
+            # The first click of this double-click already toggled play/pause;
+            # undo it so a double-click means only "mini mode".
+            if (([DateTime]::UtcNow - $script:clickToggledAt).TotalMilliseconds -lt 800) {
+                $script:userPaused = -not $script:userPaused
+                $script:clickToggledAt = [DateTime]::MinValue
+            }
             Set-MiniMode $true
+            return
+        }
+
+        # Single click on the final video: play/pause. Still a drag surface:
+        # DragMove() returns on mouse-up, and only an unmoved press counts as a click.
+        if ($inPreview -and $script:hasFinalVideo) {
+            $e.Handled = $true
+            $x0 = $window.Left; $y0 = $window.Top
+            try { $window.DragMove() } catch {}
+            if ([Math]::Abs($window.Left - $x0) -lt 1 -and [Math]::Abs($window.Top - $y0) -lt 1) {
+                if (Switch-VideoPause) { $script:clickToggledAt = [DateTime]::UtcNow }
+            }
             return
         }
 
@@ -835,11 +1043,40 @@ $window.Add_PreviewMouseLeftButtonDown({
         }
 
         $p = $e.GetPosition($window)
-        $b = 8.0
+        # No resize band in mini mode, so the whole widget can be dragged.
+        $b = if ($script:isMini) { -1.0 } else { 8.0 }
         if ($p.X -gt $b -and $p.X -lt ($window.ActualWidth - $b) -and
             $p.Y -gt $b -and $p.Y -lt ($window.ActualHeight - $b)) {
             $e.Handled = $true
+
+            # Double-click anywhere on the widget (digits, stats, frame, empty area)
+            # toggles mini mode. ClickCount is unreliable here because the first click
+            # runs DragMove(), so also compare time / position with the last unmoved click.
+            $dblMs = 500.0
+            try { $dblMs = [double][SlimyNative]::GetDoubleClickTime() } catch {}
+            $isDouble = ($e.ClickCount -ge 2)
+            if (-not $isDouble -and $script:lastBlankClickAt -ne [DateTime]::MinValue) {
+                $dt = ([DateTime]::UtcNow - $script:lastBlankClickAt).TotalMilliseconds
+                if ($dt -le $dblMs -and
+                    [Math]::Abs($p.X - $script:lastBlankClickX) -le 6.0 -and
+                    [Math]::Abs($p.Y - $script:lastBlankClickY) -le 6.0) { $isDouble = $true }
+            }
+            if ($isDouble) {
+                $script:lastBlankClickAt = [DateTime]::MinValue
+                Set-MiniMode (-not $script:isMini)
+                return
+            }
+
+            $x0 = $window.Left; $y0 = $window.Top
             $window.DragMove()
+            if ([Math]::Abs($window.Left - $x0) -lt 1 -and [Math]::Abs($window.Top - $y0) -lt 1) {
+                # Unmoved press = a click; remember it for double-click detection.
+                $script:lastBlankClickAt = [DateTime]::UtcNow
+                $script:lastBlankClickX = $p.X
+                $script:lastBlankClickY = $p.Y
+            } else {
+                $script:lastBlankClickAt = [DateTime]::MinValue
+            }
         }
     } catch {}
 })
@@ -851,6 +1088,12 @@ $window.Add_SourceInitialized({
     $hook = [System.Windows.Interop.HwndSourceHook]{
         param($hWnd, $msg, $wParam, $lParam, [ref]$handled)
         if ($msg -ne 0x0084) { return [IntPtr]::Zero }
+        if ($script:isMini) {
+            # Mini widget can't be resized anyway: treat the whole window, edges
+            # included, as client so a double-click on the frame also restores it.
+            $handled.Value = $true
+            return [IntPtr]1
+        }
         $rect = [SlimyNative+RECT]::new()
         [SlimyNative]::GetWindowRect($hWnd, [ref]$rect) | Out-Null
         $raw = $lParam.ToInt64()
