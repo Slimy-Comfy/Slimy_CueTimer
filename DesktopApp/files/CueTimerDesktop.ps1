@@ -14,7 +14,7 @@ try {
 } catch {}
 # Shown as the status-text tooltip and logged at startup, so it is always clear
 # WHICH script file the exe actually ran (it runs DesktopApp\files\CueTimerDesktop.ps1).
-$script:buildTag = 'CueTimerDesktop.ps1 2026-10-16 fit-measured'
+$script:buildTag = 'CueTimerDesktop.ps1 2026-10-30 history+anchor'
 trap { try { ($_ | Out-String) | Set-Content -Encoding UTF8 $script:logPath } catch {} ; exit 1 }
 
 Add-Type -AssemblyName PresentationFramework
@@ -22,15 +22,22 @@ Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms   # Screen.FromHandle: work area of the widget's monitor
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-# Resolve ComfyUI base URL from the existing INI when available.
+# Resolve ComfyUI base URL (and optional settings) from the INI when available.
+#   url          = http://127.0.0.1:8188/slimy/cuetimer/desktop
+#   history_rows = 3      (0 hides the history list, max 10)
 $desktopUrl = 'http://127.0.0.1:8188/slimy/cuetimer/desktop'
+$script:historyRows = 3
 $iniPath = Join-Path $PSScriptRoot 'CueTimerDesktop.ini'
 if (Test-Path $iniPath) {
     foreach ($line in Get-Content $iniPath) {
-        if ($line -match '^\s*url\s*=\s*(.+?)\s*$') { $desktopUrl = $matches[1]; break }
+        if ($line -match '^\s*url\s*=\s*(.+?)\s*$') { $desktopUrl = $matches[1] }
+        elseif ($line -match '^\s*history_rows\s*=\s*(\d+)\s*$') {
+            $script:historyRows = [Math]::Min(10, [Math]::Max(0, [int]$matches[1]))
+        }
     }
 }
 try {
@@ -55,6 +62,7 @@ public static class SlimyNative {
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
 }
 "@
@@ -71,6 +79,7 @@ public static class SlimyNative {
         <RowDefinition Height="Auto" MinHeight="32"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="6"/>
+        <RowDefinition Height="Auto"/>
         <RowDefinition Height="Auto"/>
         <RowDefinition Height="*"/>
         <RowDefinition Height="Auto"/>
@@ -144,7 +153,13 @@ public static class SlimyNative {
                   Foreground="#EEF2F7" FontSize="12" FontWeight="SemiBold" Padding="2"/>
       </StackPanel>
 
-      <Border x:Name="PreviewWrap" Grid.Row="4" Background="#0B0D11" BorderBrush="#2C313D" BorderThickness="1"
+      <!-- Recent renders: time / frames / steps / size, newest first (rows built in code). -->
+      <Border x:Name="HistoryWrap" Grid.Row="4" Visibility="Collapsed" Margin="2,7,2,0" Padding="0,4,0,0"
+              BorderBrush="#232833" BorderThickness="0,1,0,0">
+        <StackPanel x:Name="HistoryPanel"/>
+      </Border>
+
+      <Border x:Name="PreviewWrap" Grid.Row="5" Background="#0B0D11" BorderBrush="#2C313D" BorderThickness="1"
               CornerRadius="8" Margin="0,6,0,8" ClipToBounds="True">
         <Grid>
           <Image x:Name="PreviewImage" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
@@ -162,7 +177,7 @@ public static class SlimyNative {
         </Grid>
       </Border>
 
-      <Grid x:Name="BottomPanel" Grid.Row="5" Margin="0,1,0,9" Height="25">
+      <Grid x:Name="BottomPanel" Grid.Row="6" Margin="0,1,0,9" Height="25">
         <TextBlock x:Name="StatusText" Text="Connecting…" Foreground="#6F7A89" FontSize="10"
                    HorizontalAlignment="Left" VerticalAlignment="Center" MaxWidth="72"
                    TextTrimming="CharacterEllipsis"/>
@@ -213,6 +228,8 @@ $miniButtonText = $window.FindName('MiniButtonText')
 $restoreIcon = $window.FindName('RestoreIcon')
 $controlsPanel = $window.FindName('ControlsPanel')
 $bottomPanel = $window.FindName('BottomPanel')
+$historyWrap = $window.FindName('HistoryWrap')
+$historyPanel = $window.FindName('HistoryPanel')
 try { $statusText.ToolTip = $script:buildTag + "`n" + $PSCommandPath } catch {}
 try { ('{0} started {1} from {2}' -f (Get-Date -Format o), $script:buildTag, $PSCommandPath) | Add-Content -Encoding UTF8 $script:logPath } catch {}
 
@@ -248,8 +265,8 @@ $script:restoreWidth = 430.0
 $script:restoreHeight = 520.0
 $script:restoreMinWidth = 160.0
 $script:restoreMinHeight = 190.0
-$script:restoreLeft = [double]::NaN
-$script:restoreTop = [double]::NaN
+$script:historySig = $null
+$script:historyRowsUi = [System.Collections.Generic.List[object]]::new()
 # Final video playback: the user's click choice, and what the MediaElement is doing now.
 $script:userPaused = $false
 $script:videoPlaying = $false
@@ -355,33 +372,90 @@ function Update-ResponsiveTypography {
 }
 
 
+# ── Window placement helpers (mini <-> normal) ───────────────────────────────
+# Mini/restore resizes around the widget's CURRENT top-left or top-right corner
+# (whichever side of the monitor it sits on), so moving the mini widget and then
+# restoring grows it in place instead of jumping back to the old position.
+
+function Get-WindowHandle {
+    return ([System.Windows.Interop.WindowInteropHelper]::new($window)).Handle
+}
+
+# Work area (screen minus taskbar) of the monitor the widget is on, in WPF DIPs.
+function Get-WorkAreaDip {
+    try {
+        $hwnd = Get-WindowHandle
+        $src = [System.Windows.PresentationSource]::FromVisual($window)
+        if ($hwnd -ne [IntPtr]::Zero -and $src -and $src.CompositionTarget) {
+            $wa = [System.Windows.Forms.Screen]::FromHandle($hwnd).WorkingArea
+            $m = $src.CompositionTarget.TransformFromDevice
+            $tl = $m.Transform([System.Windows.Point]::new($wa.Left, $wa.Top))
+            $br = $m.Transform([System.Windows.Point]::new($wa.Right, $wa.Bottom))
+            return [System.Windows.Rect]::new($tl, $br)
+        }
+    } catch {}
+    return [System.Windows.SystemParameters]::WorkArea
+}
+
+# Move + resize in ONE native call (no intermediate frame where the window has
+# the new size at the old position), then mirror the values into WPF.
+function Set-WindowRect([double]$l, [double]$t, [double]$w, [double]$h) {
+    try {
+        $hwnd = Get-WindowHandle
+        $src = [System.Windows.PresentationSource]::FromVisual($window)
+        if ($hwnd -ne [IntPtr]::Zero -and $src -and $src.CompositionTarget) {
+            $m = $src.CompositionTarget.TransformToDevice
+            $p = $m.Transform([System.Windows.Point]::new($l, $t))
+            $flags = [uint32](0x0004 -bor 0x0010)   # SWP_NOZORDER | SWP_NOACTIVATE
+            [void][SlimyNative]::SetWindowPos($hwnd, [IntPtr]::Zero,
+                [int][Math]::Round($p.X), [int][Math]::Round($p.Y),
+                [int][Math]::Round($w * $m.M11), [int][Math]::Round($h * $m.M22), $flags)
+        }
+    } catch {}
+    $window.Left = $l; $window.Top = $t
+    $window.Width = $w; $window.Height = $h
+}
+
+# Resize to $newW x $newH keeping the top edge and the corner nearest the
+# monitor edge: right half of the screen -> top-right fixed, else top-left.
+function Resize-Anchored([double]$newW, [double]$newH) {
+    $l = [double]$window.Left
+    $t = [double]$window.Top
+    $w = [double]$window.ActualWidth
+    if ($w -le 0) { $w = [double]$window.Width }
+    $wa = Get-WorkAreaDip
+    $anchorRight = (($l + $w / 2.0) -gt ($wa.Left + $wa.Width / 2.0))
+    # The anchored corner stays exactly where it is: no clamping / sliding.
+    $newL = if ($anchorRight) { $l + $w - $newW } else { $l }
+    Set-WindowRect $newL $t $newW $newH
+}
+
 function Set-MiniMode([bool]$enable) {
     try {
         if ($enable -eq $script:isMini) { return }
 
         if ($enable) {
+            # Only the SIZE is remembered; the position always follows the widget.
             $script:restoreWidth = [double]$window.ActualWidth
             $script:restoreHeight = [double]$window.ActualHeight
             $script:restoreMinWidth = [double]$window.MinWidth
             $script:restoreMinHeight = [double]$window.MinHeight
-            $script:restoreLeft = [double]$window.Left
-            $script:restoreTop = [double]$window.Top
 
             $script:isMini = $true
             $statsBox.Visibility = 'Collapsed'
             $progress.Visibility = 'Collapsed'
             $controlsPanel.Visibility = 'Collapsed'
             $previewWrap.Visibility = 'Collapsed'
+            $historyWrap.Visibility = 'Collapsed'
             $bottomPanel.Visibility = 'Collapsed'
             $closeButton.Visibility = 'Visible'
 
             $window.ResizeMode = 'NoResize'
+            $window.MinWidth = 0
+            $window.MinHeight = 0
+            Resize-Anchored 275 76
             $window.MinWidth = 275
             $window.MinHeight = 76
-            $window.Width = 275
-            $window.Height = 76
-            if (-not [double]::IsNaN($script:restoreLeft)) { $window.Left = $script:restoreLeft }
-            if (-not [double]::IsNaN($script:restoreTop)) { $window.Top = $script:restoreTop }
 
             $miniButton.Width = 30
             $miniButton.Height = 28
@@ -395,12 +469,12 @@ function Set-MiniMode([bool]$enable) {
             $script:isMini = $false
 
             $window.ResizeMode = 'CanResize'
+            $window.MinWidth = 0
+            $window.MinHeight = 0
+            # Grow from the mini widget's current corner (not the pre-mini position).
+            Resize-Anchored $script:restoreWidth $script:restoreHeight
             $window.MinWidth = $script:restoreMinWidth
             $window.MinHeight = $script:restoreMinHeight
-            $window.Width = $script:restoreWidth
-            $window.Height = $script:restoreHeight
-            if (-not [double]::IsNaN($script:restoreLeft)) { $window.Left = $script:restoreLeft }
-            if (-not [double]::IsNaN($script:restoreTop)) { $window.Top = $script:restoreTop }
 
             $controlsPanel.Visibility = 'Visible'
             Update-TimerVisibility
@@ -452,6 +526,97 @@ function Update-TimerVisibility {
     } else {
         $statsBox.Visibility = if ($showTimer) { 'Visible' } else { 'Collapsed' }
         $progress.Visibility = if ($showTimer) { 'Visible' } else { 'Collapsed' }
+    }
+    # History follows the Timer toggle, like the history list in the node.
+    $showHistory = $showTimer -and (-not $script:isMini) -and ($script:historyRows -gt 0) -and ($historyPanel.Children.Count -gt 0)
+    $historyWrap.Visibility = if ($showHistory) { 'Visible' } else { 'Collapsed' }
+}
+
+# ── History list ──────────────────────────────────────────────────────────────
+function New-FrozenBrush([byte]$a, [byte]$r, [byte]$g, [byte]$b) {
+    $br = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromArgb($a, $r, $g, $b))
+    $br.Freeze()
+    return $br
+}
+# Newest row brightest, older rows fade (same idea as the node).
+$script:histTextAlpha  = @(0xD9, 0x8C, 0x5C, 0x45)
+$script:histStampAlpha = @(0x80, 0x55, 0x3A, 0x2C)
+
+function Format-HistoryEntry($entry) {
+    if ($entry -is [string]) {
+        return [PSCustomObject]@{ Text = $entry; Stamp = ''; IsError = $false }
+    }
+    $isError = ([string]$entry.type -eq 'error')
+    $text = [string]$entry.time
+    if ([string]::IsNullOrEmpty($text)) { $text = '--:--:---' }
+    if ($isError) { $text += ' ⚠' }
+    if ([int]$entry.frames -gt 0) { $text += ('  {0}f' -f [int]$entry.frames) }
+    if ([int]$entry.steps -gt 0) { $text += ('  {0}step' -f [int]$entry.steps) }
+    if ([int]$entry.width -gt 0 -and [int]$entry.height -gt 0) {
+        $text += ('  {0}×{1}' -f [int]$entry.width, [int]$entry.height)
+    }
+    # "2026/06/28 15:50" -> "06/28 15:50" (year adds nothing in a short list)
+    $stamp = ([string]$entry.stamp) -replace '^\d{4}/', ''
+    return [PSCustomObject]@{ Text = $text; Stamp = $stamp; IsError = $isError }
+}
+
+function Update-History($state) {
+    $items = @()
+    if ($null -ne $state.history -and $script:historyRows -gt 0) {
+        $items = @($state.history | Select-Object -First $script:historyRows | ForEach-Object { Format-HistoryEntry $_ })
+    }
+    # Rebuild only when the visible rows actually changed (poll runs 4x/sec).
+    $sig = ($items | ForEach-Object { $_.Text + '|' + $_.Stamp }) -join "`n"
+    if ($sig -eq $script:historySig) { return }
+    $script:historySig = $sig
+
+    $historyPanel.Children.Clear()
+    $script:historyRowsUi.Clear()
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        $it = $items[$i]
+        $ai = [Math]::Min($i, $script:histTextAlpha.Count - 1)
+        $rgb = if ($it.IsError) { @(0xFF, 0x50, 0x50) } else { @(0x00, 0xFF, 0x66) }
+
+        $row = [System.Windows.Controls.Grid]::new()
+        $c0 = [System.Windows.Controls.ColumnDefinition]::new(); $c0.Width = [System.Windows.GridLength]::new(1, 'Star')
+        $c1 = [System.Windows.Controls.ColumnDefinition]::new(); $c1.Width = [System.Windows.GridLength]::Auto
+        $row.ColumnDefinitions.Add($c0); $row.ColumnDefinitions.Add($c1)
+
+        $main = [System.Windows.Controls.TextBlock]::new()
+        $main.Text = $it.Text
+        $main.FontFamily = 'Consolas'
+        $main.FontWeight = [System.Windows.FontWeights]::SemiBold
+        $main.TextTrimming = 'CharacterEllipsis'
+        $main.Foreground = New-FrozenBrush $script:histTextAlpha[$ai] $rgb[0] $rgb[1] $rgb[2]
+        [System.Windows.Controls.Grid]::SetColumn($main, 0)
+
+        $stamp = [System.Windows.Controls.TextBlock]::new()
+        $stamp.Text = $it.Stamp
+        $stamp.FontFamily = 'Consolas'
+        $stamp.Margin = [System.Windows.Thickness]::new(8, 0, 0, 0)
+        $stamp.Foreground = New-FrozenBrush $script:histStampAlpha[$ai] $rgb[0] $rgb[1] $rgb[2]
+        [System.Windows.Controls.Grid]::SetColumn($stamp, 1)
+
+        [void]$row.Children.Add($main)
+        [void]$row.Children.Add($stamp)
+        [void]$historyPanel.Children.Add($row)
+        $script:historyRowsUi.Add([PSCustomObject]@{ Main = $main; Stamp = $stamp })
+    }
+    Update-HistoryTypography
+    Update-TimerVisibility
+}
+
+# History font follows window width; the date column is dropped when narrow.
+function Update-HistoryTypography {
+    $w = [double]$window.ActualWidth
+    if ($w -le 0) { $w = [double]$window.Width }
+    $scale = [Math]::Min(1.0, [Math]::Max(0.25, $w / 430.0))
+    $font = [Math]::Max(10.0, 13.5 * $scale)
+    $stampVis = if ($w -ge 300) { 'Visible' } else { 'Collapsed' }
+    foreach ($r in $script:historyRowsUi) {
+        $r.Main.FontSize = $font
+        $r.Stamp.FontSize = $font
+        $r.Stamp.Visibility = $stampVis
     }
 }
 
@@ -861,7 +1026,7 @@ $window.Add_SourceInitialized({
     } catch {}
 })
 
-$window.Add_SizeChanged({ Update-ResponsiveTypography })
+$window.Add_SizeChanged({ Update-ResponsiveTypography; Update-HistoryTypography })
 # Minimize / restore: drop to near-idle while minimized, resume on restore.
 $window.Add_StateChanged({ Update-IdleMode })
 if ($previewWrap) { $previewWrap.ToolTip = 'Click: play / pause video   Double-click: mini mode' }
@@ -886,6 +1051,9 @@ $pollTimer.Add_Tick({
         $pctText.Text = ('{0:0}%' -f $p)
         $progress.Value = $p
         Update-ResultMetrics $s
+        try { Update-History $s } catch {
+            try { ('History update failed: ' + $_.Exception.Message) | Add-Content -Encoding UTF8 $script:logPath } catch {}
+        }
 
         $remoteTimerVisible = ($s.timer_visible -ne $false)
         if ($null -ne $script:pendingTimerVisible) {
